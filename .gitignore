@@ -200,6 +200,9 @@ figure_*.png
 plot_*.png
 temp_plot.*
 
+# Offline wheel files - too large for GitHub
+offline_wheels/
+
 # Model files (large ML models)
 *.joblib
 *.model

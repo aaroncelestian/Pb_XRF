@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import json
 import numpy as np
 import pandas as pd
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
@@ -9,15 +10,22 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                                QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
                                QTableWidget, QTableWidgetItem, QTabWidget,
                                QMessageBox, QSplitter, QScrollArea, QDialog,
-                               QDialogButtonBox, QTextBrowser)
+                               QDialogButtonBox, QTextBrowser, QProgressDialog,
+                               QListWidget)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+try:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+except ImportError:
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    except ImportError:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
-from scipy import integrate
+from scipy import integrate, stats
 import warnings
 warnings.filterwarnings('ignore')
 from pathlib import Path
@@ -311,6 +319,8 @@ class XRFPeakFitter:
         # NIST calibration parameters
         self.calibration_slope = 13.8913
         self.calibration_intercept = 0.0
+        # Custom calibration name
+        self.calibration_name = "NIST Calibration"
         
     def gaussian_a(self, x, a, x0, dx):
         """
@@ -557,6 +567,35 @@ class PlotCanvas(FigureCanvas):
         except:
             pass
         
+        # Initialize subplots immediately
+        self.setup_subplots()
+        
+        # Store current data for zoom updates
+        self.current_spectrum_data = None
+        
+        # Connect to zoom/pan events for auto Y-scaling
+        self.setup_zoom_events()
+        
+    def setup_zoom_events(self):
+        """Setup event handlers for zoom/pan to trigger Y-axis auto-scaling"""
+        try:
+            # Connect to xlim change events (fired when user zooms or pans)
+            if hasattr(self, 'ax1'):
+                self.ax1.callbacks.connect('xlim_changed', self.on_xlim_changed)
+        except Exception as e:
+            print(f"Warning: Could not setup zoom events: {e}")
+    
+    def on_xlim_changed(self, ax):
+        """Called when X-axis limits change (zoom/pan)"""
+        try:
+            if self.current_spectrum_data is not None:
+                x, y, fit_x, fit_y, background_x, background_y = self.current_spectrum_data
+                x_min, x_max = ax.get_xlim()
+                self.update_y_limits_for_zoom(x, y, fit_x, fit_y, background_x, background_y, x_min, x_max)
+                self.draw_idle()  # Use draw_idle for better performance
+        except Exception as e:
+            print(f"Error in xlim_changed handler: {e}")
+    
     def setup_subplots(self):
         """Setup subplots for spectrum and calibration"""
         self.fig.clear()
@@ -584,55 +623,134 @@ class PlotCanvas(FigureCanvas):
     def plot_spectrum(self, x, y, fit_x=None, fit_y=None, background_x=None, background_y=None, 
                      r_squared=None, concentration=None, title="XRF Spectrum"):
         """Plot spectrum with optional fit overlay, background curve, R² value, and Pb concentration"""
-        # Clear only the top subplot (ax1) for spectrum display
-        self.ax1.clear()
-        
-        # Plot raw data
-        self.ax1.plot(x, y, 'b-', linewidth=1, label='Raw Data', alpha=0.7)
-        
-        # Plot background curve if provided
-        if background_x is not None and background_y is not None:
-            self.ax1.plot(background_x, background_y, 'g--', linewidth=1.5, 
-                         label='Background', alpha=0.8)
-        
-        # Plot fit if provided
-        if fit_x is not None and fit_y is not None:
-            self.ax1.plot(fit_x, fit_y, 'r-', linewidth=2, label='Gaussian-A Fit')
-        
-        self.ax1.set_xlabel('Energy (keV)')
-        self.ax1.set_ylabel('Intensity (counts)')
-        
-        # Add R² to title if provided
-        if r_squared is not None:
-            title_with_r2 = f"{title} (R² = {r_squared:.4f})"
-        else:
-            title_with_r2 = title
-        self.ax1.set_title(title_with_r2)
-        
-        self.ax1.grid(True, alpha=0.3)
-        
-        # Create legend with concentration info if available
-        if concentration is not None:
-            # Add concentration info to the plot
-            legend_text = f'Pb: {concentration:.2f} ppm'
-            self.ax1.text(0.02, 0.98, legend_text, transform=self.ax1.transAxes, 
-                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
-                         fontsize=10, fontweight='bold')
-        
-        self.ax1.legend()
-        
-        # Highlight Pb peak region
-        self.ax1.axvspan(10.0, 11.0, alpha=0.2, color='yellow', label='Pb Peak Region')
-        
-        # Set zoom limits if available
-        if hasattr(self, 'display_min') and hasattr(self, 'display_max'):
-            self.ax1.set_xlim(self.display_min, self.display_max)
-        else:
-            # Default zoom around Pb peak if no custom range set
-            self.ax1.set_xlim(9.5, 11.5)
-        
-        self.fig.tight_layout()
-        self.draw()
+        try:
+            # Ensure subplots are set up
+            if not hasattr(self, 'ax1'):
+                self.setup_subplots()
+                self.setup_zoom_events()  # Reconnect events after subplot setup
+
+            # Store current spectrum data for zoom event handling
+            self.current_spectrum_data = (x, y, fit_x, fit_y, background_x, background_y)
+
+            # 1. Save current zoom window (if any), else use display_min/max or default
+            try:
+                x_min, x_max = self.ax1.get_xlim()
+                # If the current zoom is the default (0, 1), use display_min/max or default
+                if x_min == 0.0 and x_max == 1.0:
+                    raise Exception()
+            except:
+                if hasattr(self, 'display_min') and hasattr(self, 'display_max'):
+                    x_min, x_max = self.display_min, self.display_max
+                else:
+                    x_min, x_max = 9.5, 11.5
+
+            # 2. Clear and plot with ORIGINAL intensity values (no normalization)
+            self.ax1.clear()
+            
+            # Reconnect zoom events after clearing (clearing removes callbacks)
+            self.ax1.callbacks.connect('xlim_changed', self.on_xlim_changed)
+            
+            self.ax1.plot(x, y, 'b-', linewidth=1, label='Raw Data', alpha=0.7)
+            if background_x is not None and background_y is not None:
+                self.ax1.plot(background_x, background_y, 'g--', linewidth=1.5, label='Background', alpha=0.8)
+            if fit_x is not None and fit_y is not None:
+                self.ax1.plot(fit_x, fit_y, 'r-', linewidth=2, label='Gaussian-A Fit')
+
+            self.ax1.set_xlabel('Energy (keV)')
+            self.ax1.set_ylabel('Intensity (counts)')
+            if r_squared is not None:
+                title_with_r2 = f"{title} (R² = {r_squared:.4f})"
+            else:
+                title_with_r2 = title
+            self.ax1.set_title(title_with_r2)
+            self.ax1.grid(True, alpha=0.3)
+            if concentration is not None:
+                legend_text = f'Pb: {concentration:.2f} ppm'
+                self.ax1.text(0.02, 0.98, legend_text, transform=self.ax1.transAxes, 
+                             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+                             fontsize=10, fontweight='bold')
+            self.ax1.legend()
+            self.ax1.axvspan(10.0, 11.0, alpha=0.2, color='yellow', label='Pb Peak Region')
+
+            # 3. Restore X zoom window
+            self.ax1.set_xlim(x_min, x_max)
+            
+            # 4. Auto-scale Y-axis based only on data within the current X zoom window
+            self.update_y_limits_for_zoom(x, y, fit_x, fit_y, background_x, background_y, x_min, x_max)
+            
+            self.fig.tight_layout()
+            self.draw()
+        except Exception as e:
+            print(f"Error in plot_spectrum: {e}")
+            try:
+                self.setup_subplots()
+                self.setup_zoom_events()
+                self.ax1.clear()
+                self.ax1.plot(x, y, 'b-', linewidth=1, label='Raw Data', alpha=0.7)
+                self.ax1.set_xlabel('Energy (keV)')
+                self.ax1.set_ylabel('Intensity (counts)')
+                self.ax1.set_title(title)
+                self.ax1.grid(True, alpha=0.3)
+                self.ax1.legend()
+                self.fig.tight_layout()
+                self.draw()
+            except Exception as e2:
+                print(f"Failed to recover from plotting error: {e2}")
+    
+    def update_y_limits_for_zoom(self, x, y, fit_x=None, fit_y=None, background_x=None, background_y=None, x_min=None, x_max=None):
+        """Update Y-axis limits based on data within the current X zoom window"""
+        try:
+            # Get current X limits if not provided
+            if x_min is None or x_max is None:
+                x_min, x_max = self.ax1.get_xlim()
+            
+            # Collect all Y values within the X zoom window
+            all_y_values = []
+            
+            # Raw data within zoom window
+            mask = (x >= x_min) & (x <= x_max)
+            if mask.any():
+                all_y_values.extend(y[mask])
+            
+            # Fit data within zoom window
+            if fit_x is not None and fit_y is not None:
+                fit_mask = (fit_x >= x_min) & (fit_x <= x_max)
+                if fit_mask.any():
+                    all_y_values.extend(fit_y[fit_mask])
+            
+            # Background data within zoom window
+            if background_x is not None and background_y is not None:
+                bg_mask = (background_x >= x_min) & (background_x <= x_max)
+                if bg_mask.any():
+                    all_y_values.extend(background_y[bg_mask])
+            
+            # Calculate Y limits with some padding
+            if all_y_values:
+                y_min = min(all_y_values)
+                y_max = max(all_y_values)
+                
+                # Add 5% padding on both sides
+                y_range = y_max - y_min
+                if y_range > 0:
+                    padding = 0.05 * y_range
+                    new_y_min = y_min - padding
+                    new_y_max = y_max + padding
+                    self.ax1.set_ylim(new_y_min, new_y_max)
+                else:
+                    # If all values are the same, add some default padding
+                    self.ax1.set_ylim(y_min - 1, y_max + 1)
+            else:
+                # Fallback: use full data range
+                self.ax1.set_ylim(y.min(), y.max())
+                
+        except Exception as e:
+            print(f"Error updating Y limits: {e}")
+            # Fallback: use automatic scaling
+            try:
+                self.ax1.relim()
+                self.ax1.autoscale_view()
+            except:
+                pass
     
     def plot_sample_statistics(self, sample_groups):
         """Plot sample statistics and calibration verification"""
@@ -677,11 +795,42 @@ class PlotCanvas(FigureCanvas):
         # Calibration verification plot
         self.ax3.scatter(mean_intensities, mean_concentrations, s=60, alpha=0.7, color='blue')
         
-        # Plot calibration line
+        # Plot calibration line using CURRENT calibration parameters
         if mean_intensities:
             x_cal = np.linspace(min(mean_intensities), max(mean_intensities), 100)
-            y_cal = 13.8913 * x_cal + 0.0
-            self.ax3.plot(x_cal, y_cal, 'r--', linewidth=2, label='NIST Calibration')
+            
+            # Try to get current calibration parameters from parent GUI
+            try:
+                # Access the GUI through the parent chain
+                gui_parent = self.parent()
+                while gui_parent and not hasattr(gui_parent, 'fitter'):
+                    gui_parent = gui_parent.parent()
+                
+                if gui_parent and hasattr(gui_parent, 'fitter'):
+                    slope = gui_parent.fitter.calibration_slope
+                    intercept = gui_parent.fitter.calibration_intercept
+                    cal_name = getattr(gui_parent.fitter, 'calibration_name', None)
+                    
+                    # Determine calibration type for label
+                    if cal_name:
+                        cal_label = cal_name
+                    elif abs(slope - 13.8913) < 0.0001 and abs(intercept - 0.0) < 0.0001:
+                        cal_label = 'NIST Calibration'
+                    else:
+                        cal_label = 'Custom Calibration'
+                else:
+                    # Fallback to default NIST values
+                    slope = 13.8913
+                    intercept = 0.0
+                    cal_label = 'NIST Calibration'
+            except:
+                # Fallback to default NIST values
+                slope = 13.8913
+                intercept = 0.0
+                cal_label = 'NIST Calibration'
+            
+            y_cal = slope * x_cal + intercept
+            self.ax3.plot(x_cal, y_cal, 'r--', linewidth=2, label=cal_label)
             self.ax3.legend()
         
         self.ax3.set_xlabel('Mean Integrated Intensity')
@@ -795,36 +944,16 @@ class ProcessingThread(QThread):
         return sample_groups
     
     def read_xrf_file(self, file_path):
-        """Read XRF data from various file formats"""
+        """Read XRF data from various file formats using smart detection"""
         try:
-            # First try to read as EMSA format
-            if file_path.lower().endswith('.txt'):
-                try:
-                    metadata, spectrum_df = parse_emsa_file_pandas(file_path)
-                    if spectrum_df is not None and len(spectrum_df) > 0:
-                        x = spectrum_df['energy_kev'].values
-                        y = spectrum_df['counts'].values
-                        return x, y
-                except Exception as emsa_error:
-                    print(f"Not EMSA format, trying other formats: {emsa_error}")
+            # Use the smart parser that automatically detects file format
+            x, y, format_type = parse_xrf_file_smart(file_path)
             
-            # Try different file formats
-            if file_path.lower().endswith('.csv'):
-                df = pd.read_csv(file_path)
-            elif file_path.lower().endswith('.txt'):
-                df = pd.read_csv(file_path, delimiter='\t')
-            elif file_path.lower().endswith('.xlsx'):
-                df = pd.read_excel(file_path)
-            else:
-                # Try to read as space-separated values
-                df = pd.read_csv(file_path, delimiter=r'\s+')
-            
-            # Assume first column is energy, second is intensity
-            if len(df.columns) >= 2:
-                x = df.iloc[:, 0].values
-                y = df.iloc[:, 1].values
+            if x is not None and y is not None:
+                print(f"Successfully parsed {os.path.basename(file_path)} as {format_type} format")
                 return x, y
             else:
+                print(f"Failed to parse {file_path} with smart parser")
                 return None
                 
         except Exception as e:
@@ -1112,6 +1241,23 @@ class XRFPeakFittingGUI(QMainWindow):
         self.update_calibration_btn.clicked.connect(self.update_calibration)
         calibration_layout.addWidget(self.update_calibration_btn, 3, 0, 1, 2)
         
+        # Custom calibration button
+        self.custom_calibration_btn = QPushButton("🧪 Create Custom Calibration")
+        self.custom_calibration_btn.clicked.connect(self.show_custom_calibration_dialog)
+        self.custom_calibration_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        calibration_layout.addWidget(self.custom_calibration_btn, 4, 0, 1, 2)
+        
         fitting_layout.addWidget(calibration_group)
         fitting_layout.addStretch()
         self.advanced_subtabs.addTab(fitting_tab, "Fitting & Calibration")
@@ -1222,8 +1368,16 @@ class XRFPeakFittingGUI(QMainWindow):
             right_panel.addWidget(self.plot_toolbar)
         else:
             # Fallback to standard toolbar
-            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
-            self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, self)
+            try:
+                from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+                self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, self)
+            except ImportError:
+                try:
+                    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+                    self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, self)
+                except ImportError:
+                    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+                    self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, self)
             right_panel.addWidget(self.plot_toolbar)
         
         right_panel.addWidget(self.plot_canvas)
@@ -1326,7 +1480,16 @@ class XRFPeakFittingGUI(QMainWindow):
                                   f"Calibration updated:\nSlope: {slope}\nIntercept: {intercept}")
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Please enter valid numerical values for calibration parameters")
-        
+    
+    def show_custom_calibration_dialog(self):
+        """Show the custom calibration dialog"""
+        try:
+            dialog = CustomCalibrationDialog(self)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error opening custom calibration dialog: {str(e)}")
+            print(f"Custom calibration dialog error: {e}")  # For debugging
+    
     def select_single_file(self):
         """Select a single XRF file"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1377,34 +1540,16 @@ class XRFPeakFittingGUI(QMainWindow):
             QMessageBox.warning(self, "Error", f"Error loading file: {str(e)}")
     
     def read_xrf_file(self, file_path):
-        """Read XRF data from file"""
+        """Read XRF data from file using smart format detection"""
         try:
-            # First try to read as EMSA format
-            if file_path.lower().endswith('.txt'):
-                try:
-                    metadata, spectrum_df = parse_emsa_file_pandas(file_path)
-                    if spectrum_df is not None and len(spectrum_df) > 0:
-                        x = spectrum_df['energy_kev'].values
-                        y = spectrum_df['counts'].values
-                        return x, y
-                except Exception as emsa_error:
-                    print(f"Not EMSA format, trying other formats: {emsa_error}")
+            # Use the smart parser that automatically detects file format
+            x, y, format_type = parse_xrf_file_smart(file_path)
             
-            # Try other formats
-            if file_path.lower().endswith('.csv'):
-                df = pd.read_csv(file_path)
-            elif file_path.lower().endswith('.txt') or file_path.lower().endswith('.dat'):
-                df = pd.read_csv(file_path, delimiter='\t')
-            elif file_path.lower().endswith('.xlsx'):
-                df = pd.read_excel(file_path)
-            else:
-                df = pd.read_csv(file_path, delimiter=r'\s+')
-            
-            if len(df.columns) >= 2:
-                x = df.iloc[:, 0].values
-                y = df.iloc[:, 1].values
+            if x is not None and y is not None:
+                print(f"Successfully parsed {os.path.basename(file_path)} as {format_type} format")
                 return x, y
             else:
+                print(f"Failed to parse {file_path} with smart parser")
                 return None
                 
         except Exception as e:
@@ -1412,9 +1557,9 @@ class XRFPeakFittingGUI(QMainWindow):
             return None
     
     def fit_single_file(self):
-        """Fit peak for single file"""
+        """Fit a single XRF file"""
         if not hasattr(self, 'current_data') or self.current_data is None:
-            QMessageBox.warning(self, "Error", "No data loaded")
+            QMessageBox.warning(self, "Error", "No file loaded. Please select a file first.")
             return
         
         try:
@@ -1435,6 +1580,16 @@ class XRFPeakFittingGUI(QMainWindow):
                 integration_region=(integration_min, integration_max)
             )
             
+            # Store fit results for zoom updates
+            self.current_fit_results = {
+                'fit_params': fit_params,
+                'fit_curve': fit_curve,
+                'r_squared': r_squared,
+                'x_fit': x_fit,
+                'integrated_intensity': integrated_intensity,
+                'concentration': concentration
+            }
+            
             # Display results
             self.display_fit_results(fit_params, r_squared, integrated_intensity, concentration)
             
@@ -1446,6 +1601,9 @@ class XRFPeakFittingGUI(QMainWindow):
                 background_y = self.fitter.linear_background(x_fit, 
                                                            fit_params['background_slope'], 
                                                            fit_params['background_intercept'])
+            
+            # Store background for zoom updates
+            self.current_background = {'x': background_x, 'y': background_y}
             
             # Update plot with background curve, R², and concentration
             # Ensure subplots are set up first if not already done
@@ -1713,6 +1871,19 @@ Calibrated Concentration: {concentration:.4f}
         r_squared = result['r_squared']
         concentration = result['concentration']
         
+        # Store current data for zoom updates
+        self.current_data = (x, y)
+        
+        # Store fit results for zoom updates
+        self.current_fit_results = {
+            'fit_params': fit_params,
+            'fit_curve': fit_y,
+            'r_squared': r_squared,
+            'x_fit': fit_x,
+            'integrated_intensity': result.get('integrated_intensity', 0),
+            'concentration': concentration
+        }
+        
         # Calculate background curve for display
         background_x = None
         background_y = None
@@ -1723,6 +1894,24 @@ Calibrated Concentration: {concentration:.4f}
                 background_y = self.fitter.linear_background(fit_x, 
                                                            fit_params['background_slope'], 
                                                            fit_params['background_intercept'])
+        
+        # Store background for zoom updates
+        self.current_background = {'x': background_x, 'y': background_y}
+        
+        # Calculate sample and spectrum numbers for title
+        # Get spectra per sample from the main GUI
+        spectra_per_sample = getattr(self, 'spectra_per_sample_spin', None)
+        if spectra_per_sample:
+            spectra_per_sample_value = spectra_per_sample.value()
+        else:
+            spectra_per_sample_value = 6  # Default value
+        
+        # Calculate which sample this spectrum belongs to
+        sample_number = (self.current_spectrum_index // spectra_per_sample_value) + 1
+        spectrum_in_sample = (self.current_spectrum_index % spectra_per_sample_value) + 1
+        
+        # Create enhanced title with sample and spectrum information
+        title = f"Sample {sample_number}, Spectrum {spectrum_in_sample}/{spectra_per_sample_value} (Overall: {self.current_spectrum_index + 1}/{self.total_spectra}): {filename}"
         
         # Update plot with background curve, R², and concentration
         # Ensure subplots are set up first if not already done
@@ -1737,7 +1926,7 @@ Calibrated Concentration: {concentration:.4f}
             background_y=background_y,
             r_squared=r_squared,
             concentration=concentration,
-            title=f"Spectrum {self.current_spectrum_index + 1}/{self.total_spectra}: {filename}"
+            title=title
         )
         
         # Update info label
@@ -1873,7 +2062,38 @@ Calibrated Concentration: {concentration:.4f}
         # Redraw current spectrum if available
         if hasattr(self, 'current_data') and self.current_data is not None:
             x, y = self.current_data
-            self.plot_canvas.plot_spectrum(x, y, title="XRF Spectrum")
+            
+            # Check if we have fit results to redraw
+            if hasattr(self, 'current_fit_results') and self.current_fit_results:
+                fit_results = self.current_fit_results
+                background = getattr(self, 'current_background', {'x': None, 'y': None})
+                
+                # Generate enhanced title if this is part of batch processing
+                if hasattr(self, 'current_spectrum_index') and hasattr(self, 'total_spectra'):
+                    # Get spectra per sample value
+                    spectra_per_sample_value = getattr(self.spectra_per_sample_spin, 'value', lambda: 6)()
+                    
+                    # Calculate which sample this spectrum belongs to
+                    sample_number = (self.current_spectrum_index // spectra_per_sample_value) + 1
+                    spectrum_in_sample = (self.current_spectrum_index % spectra_per_sample_value) + 1
+                    
+                    title = f"Sample {sample_number}, Spectrum {spectrum_in_sample}/{spectra_per_sample_value} (Overall: {self.current_spectrum_index + 1}/{self.total_spectra}): {os.path.basename(self.current_file_path)}"
+                else:
+                    title = f"XRF Spectrum with Gaussian-A Fit - {os.path.basename(self.current_file_path)}"
+                
+                self.plot_canvas.plot_spectrum(
+                    x, y,
+                    fit_x=fit_results['x_fit'],
+                    fit_y=fit_results['fit_curve'],
+                    background_x=background['x'],
+                    background_y=background['y'],
+                    r_squared=fit_results['r_squared'],
+                    concentration=fit_results['concentration'],
+                    title=title
+                )
+            else:
+                # Just raw data
+                self.plot_canvas.plot_spectrum(x, y, title="XRF Spectrum")
         
         # Also update real-time plot if available
         if hasattr(self, 'latest_processed_data'):
@@ -2219,6 +2439,729 @@ Calibrated Concentration: {concentration:.4f}
         doc.add_paragraph(f"RSD: {sample_group.rsd_concentration:.2f}%")
 
 
+class CustomCalibrationDialog(QDialog):
+    """Dialog for creating custom calibrations using user's NIST standards"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Calibration Manager")
+        self.setGeometry(200, 200, 1000, 700)
+        
+        # Initialize data storage
+        self.standards_data = {
+            'SRM_2586': {'files': [], 'intensities': [], 'mean': 0, 'std': 0, 'rsd': 0, 'concentration': 432},
+            'SRM_2587': {'files': [], 'intensities': [], 'mean': 0, 'std': 0, 'rsd': 0, 'concentration': 3242}
+        }
+        self.calibration_results = None
+        self.peak_fitter = XRFPeakFitter()
+        
+        # Setup UI
+        self.init_ui()
+    
+    def init_ui(self):
+        """Initialize the user interface"""
+        layout = QVBoxLayout(self)
+        
+        # Calibration name input at the top
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Calibration Name:"))
+        self.calibration_name_edit = QLineEdit("My Custom Calibration")
+        self.calibration_name_edit.setPlaceholderText("Enter a descriptive name for your calibration...")
+        name_layout.addWidget(self.calibration_name_edit)
+        layout.addLayout(name_layout)
+        
+        # Create tab widget
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # Create tabs
+        self.setup_standards_tab()
+        self.setup_calibration_tab()
+        self.setup_validation_tab()
+        
+        # Add buttons
+        button_layout = QHBoxLayout()
+        
+        self.save_btn = QPushButton("💾 Save Calibration")
+        self.save_btn.clicked.connect(self.save_calibration)
+        self.save_btn.setEnabled(False)
+        
+        self.load_btn = QPushButton("📂 Load Calibration")
+        self.load_btn.clicked.connect(self.load_calibration)
+        
+        self.apply_btn = QPushButton("✅ Apply to Analysis")
+        self.apply_btn.clicked.connect(self.apply_calibration)
+        self.apply_btn.setEnabled(False)
+        
+        close_btn = QPushButton("❌ Close")
+        close_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.load_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(self.apply_btn)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def setup_standards_tab(self):
+        """Setup the standards configuration tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # Instructions
+        instructions = QLabel(
+            "Load XRF spectrum files for each NIST standard. "
+            "Multiple files per standard will be averaged for better precision."
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("color: #666; font-style: italic; margin: 10px;")
+        layout.addWidget(instructions)
+        
+        # Standards setup
+        for std_name, std_data in self.standards_data.items():
+            group_box = self.create_standard_group(std_name, std_data)
+            layout.addWidget(group_box)
+        
+        # Calculate button
+        calc_layout = QHBoxLayout()
+        calc_layout.addStretch()
+        self.calc_btn = QPushButton("🧮 Calculate Calibration")
+        self.calc_btn.clicked.connect(self.calculate_calibration)
+        self.calc_btn.setEnabled(False)
+        calc_layout.addWidget(self.calc_btn)
+        calc_layout.addStretch()
+        layout.addLayout(calc_layout)
+        
+        layout.addStretch()
+        self.tabs.addTab(tab, "📊 Standards Setup")
+    
+    def create_standard_group(self, std_name, std_data):
+        """Create a group box for a single standard"""
+        conc = std_data['concentration']
+        group_box = QGroupBox(f"{std_name} ({conc} ppm Pb)")
+        layout = QVBoxLayout(group_box)
+        
+        # File management
+        file_layout = QHBoxLayout()
+        
+        add_btn = QPushButton("📁 Add Files")
+        add_btn.clicked.connect(lambda: self.add_files(std_name))
+        
+        clear_btn = QPushButton("🗑️ Clear")
+        clear_btn.clicked.connect(lambda: self.clear_files(std_name))
+        
+        file_layout.addWidget(add_btn)
+        file_layout.addWidget(clear_btn)
+        file_layout.addStretch()
+        
+        layout.addLayout(file_layout)
+        
+        # File list
+        file_list = QListWidget()
+        file_list.setMaximumHeight(80)
+        layout.addWidget(file_list)
+        std_data['file_list_widget'] = file_list
+        
+        # Results display
+        results_layout = QHBoxLayout()
+        
+        mean_label = QLabel("Mean: -- cps")
+        std_label = QLabel("Std Dev: -- cps")
+        rsd_label = QLabel("RSD: -- %")
+        
+        results_layout.addWidget(mean_label)
+        results_layout.addWidget(std_label)
+        results_layout.addWidget(rsd_label)
+        results_layout.addStretch()
+        
+        layout.addLayout(results_layout)
+        
+        # Store references
+        std_data['mean_label'] = mean_label
+        std_data['std_label'] = std_label
+        std_data['rsd_label'] = rsd_label
+        
+        return group_box
+    
+    def setup_calibration_tab(self):
+        """Setup the calibration results tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # Results display
+        self.calibration_text = QTextEdit()
+        self.calibration_text.setReadOnly(True)
+        self.calibration_text.setMaximumHeight(150)
+        layout.addWidget(self.calibration_text)
+        
+        # Plot area
+        self.calibration_plot = PlotCanvas()
+        layout.addWidget(self.calibration_plot)
+        
+        self.tabs.addTab(tab, "📈 Calibration Results")
+    
+    def setup_validation_tab(self):
+        """Setup the validation tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # Validation results
+        self.validation_text = QTextEdit()
+        self.validation_text.setReadOnly(True)
+        layout.addWidget(self.validation_text)
+        
+        self.tabs.addTab(tab, "✅ Validation")
+    
+    def add_files(self, std_name):
+        """Add files for a standard"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Select {std_name} Files",
+            "",
+            "XRF Files (*.txt *.csv *.xlsx *.dat *.emsa *.spc);;All Files (*)"
+        )
+        
+        if file_paths:
+            self.standards_data[std_name]['files'].extend(file_paths)
+            self.update_file_list(std_name)
+            self.analyze_standard(std_name)
+    
+    def clear_files(self, std_name):
+        """Clear files for a standard"""
+        self.standards_data[std_name]['files'].clear()
+        self.standards_data[std_name]['intensities'].clear()
+        self.update_file_list(std_name)
+        self.update_standard_results(std_name)
+        self.check_calculation_ready()
+    
+    def update_file_list(self, std_name):
+        """Update the file list display"""
+        widget = self.standards_data[std_name]['file_list_widget']
+        widget.clear()
+        
+        for file_path in self.standards_data[std_name]['files']:
+            item_text = os.path.basename(file_path)
+            widget.addItem(item_text)
+    
+    def analyze_standard(self, std_name):
+        """Analyze all files for a standard"""
+        files = self.standards_data[std_name]['files']
+        intensities = []
+        
+        # Progress dialog
+        progress = QProgressDialog(f"Analyzing {std_name} files...", "Cancel", 0, len(files), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        try:
+            for i, file_path in enumerate(files):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(i)
+                QApplication.processEvents()
+                
+                # Read and analyze file
+                try:
+                    x, y = self.read_xrf_file(file_path)
+                    if x is not None and y is not None:
+                        # Fit peak and get intensity
+                        fit_params, fit_curve, r_squared, x_fit, integrated_intensity, concentration = self.peak_fitter.fit_peak(x, y)
+                        if integrated_intensity is not None:
+                            intensities.append(integrated_intensity)
+                except Exception as e:
+                    print(f"Error analyzing {file_path}: {e}")
+                    continue
+            
+            progress.setValue(len(files))
+            
+            # Store results
+            self.standards_data[std_name]['intensities'] = intensities
+            self.calculate_standard_stats(std_name)
+            self.update_standard_results(std_name)
+            self.check_calculation_ready()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Analysis Error", f"Error analyzing {std_name}: {e}")
+        
+        progress.close()
+    
+    def read_xrf_file(self, file_path):
+        """Read XRF file data using smart format detection"""
+        try:
+            # Use the smart parser that automatically detects file format
+            x, y, format_type = parse_xrf_file_smart(file_path)
+            
+            if x is not None and y is not None:
+                print(f"Successfully parsed {os.path.basename(file_path)} as {format_type} format")
+                return x, y
+            else:
+                print(f"Failed to parse {file_path} with smart parser")
+                return None, None
+                
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            return None, None
+    
+    def calculate_standard_stats(self, std_name):
+        """Calculate statistics for a standard"""
+        intensities = self.standards_data[std_name]['intensities']
+        
+        if intensities:
+            intensities = np.array(intensities)
+            mean_int = np.mean(intensities)
+            std_int = np.std(intensities, ddof=1) if len(intensities) > 1 else 0
+            rsd_int = (std_int / mean_int * 100) if mean_int > 0 else 0
+            
+            self.standards_data[std_name]['mean'] = mean_int
+            self.standards_data[std_name]['std'] = std_int
+            self.standards_data[std_name]['rsd'] = rsd_int
+    
+    def update_standard_results(self, std_name):
+        """Update the results display for a standard"""
+        std_data = self.standards_data[std_name]
+        
+        if std_data['intensities']:
+            std_data['mean_label'].setText(f"Mean: {std_data['mean']:.0f} cps")
+            std_data['std_label'].setText(f"Std Dev: {std_data['std']:.0f} cps")
+            std_data['rsd_label'].setText(f"RSD: {std_data['rsd']:.1f}%")
+        else:
+            std_data['mean_label'].setText("Mean: -- cps")
+            std_data['std_label'].setText("Std Dev: -- cps")
+            std_data['rsd_label'].setText("RSD: -- %")
+    
+    def check_calculation_ready(self):
+        """Check if calibration calculation can be performed"""
+        ready = all(
+            len(std_data['intensities']) > 0 
+            for std_data in self.standards_data.values()
+        )
+        self.calc_btn.setEnabled(ready)
+    
+    def calculate_calibration(self):
+        """Calculate the custom calibration"""
+        try:
+            # Prepare data for linear regression
+            concentrations = []
+            intensities = []
+            
+            for std_data in self.standards_data.values():
+                concentrations.append(std_data['concentration'])
+                intensities.append(std_data['mean'])
+            
+            concentrations = np.array(concentrations)
+            intensities = np.array(intensities)
+            
+            # Perform linear regression
+            slope, intercept, r_value, p_value, std_err = stats.linregress(intensities, concentrations)
+            
+            # Store results
+            self.calibration_results = {
+                'slope': slope,
+                'intercept': intercept,
+                'r_squared': r_value**2,
+                'p_value': p_value,
+                'std_error': std_err,
+                'concentrations': concentrations,
+                'intensities': intensities,
+                'name': self.calibration_name_edit.text().strip() or "Custom Calibration"
+            }
+            
+            # Update displays
+            self.update_calibration_display()
+            self.create_calibration_plot()
+            self.perform_validation()
+            
+            # Enable save and apply buttons
+            self.save_btn.setEnabled(True)
+            self.apply_btn.setEnabled(True)
+            
+            # Switch to results tab
+            self.tabs.setCurrentIndex(1)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Calculation Error", f"Error calculating calibration: {e}")
+    
+    def update_calibration_display(self):
+        """Update the calibration results display"""
+        if not self.calibration_results:
+            return
+        
+        results = self.calibration_results
+        
+        # Format calibration equation
+        equation = f"Concentration = {results['slope']:.6f} × Intensity + {results['intercept']:.2f}"
+        
+        text = f"""
+Custom Calibration Results
+========================
+
+Calibration Equation:
+{equation}
+
+Statistical Parameters:
+• R-squared: {results['r_squared']:.6f}
+• Standard Error: {results['std_error']:.6f}
+• P-value: {results['p_value']:.2e}
+
+Standards Data:
+• SRM 2586 (432 ppm): {self.standards_data['SRM_2586']['mean']:.0f} ± {self.standards_data['SRM_2586']['std']:.0f} cps
+• SRM 2587 (3242 ppm): {self.standards_data['SRM_2587']['mean']:.0f} ± {self.standards_data['SRM_2587']['std']:.0f} cps
+        """
+        
+        self.calibration_text.setPlainText(text.strip())
+    
+    def create_calibration_plot(self):
+        """Create the calibration plot"""
+        if not self.calibration_results:
+            return
+        
+        results = self.calibration_results
+        
+        # Clear previous plot
+        self.calibration_plot.figure.clear()
+        ax = self.calibration_plot.figure.add_subplot(111)
+        
+        # Plot data points
+        ax.scatter(results['intensities'], results['concentrations'], 
+                  color='red', s=100, alpha=0.7, label='Custom Standards', zorder=5)
+        
+        # Plot calibration line
+        x_range = np.linspace(0, max(results['intensities']) * 1.1, 100)
+        y_pred = results['slope'] * x_range + results['intercept']
+        cal_name = results.get('name', 'Custom Calibration')
+        ax.plot(x_range, y_pred, 'r-', linewidth=2, label=cal_name, alpha=0.8)
+        
+        # Plot NIST calibration for comparison
+        nist_slope = 3.297e-4
+        nist_intercept = 0
+        y_nist = nist_slope * x_range + nist_intercept
+        ax.plot(x_range, y_nist, 'b--', linewidth=2, label='NIST Calibration', alpha=0.8)
+        
+        # Add error bars
+        for i, std_name in enumerate(['SRM_2586', 'SRM_2587']):
+            std_data = self.standards_data[std_name]
+            if std_data['std'] > 0:
+                ax.errorbar(std_data['mean'], std_data['concentration'], 
+                           xerr=std_data['std'], fmt='none', color='red', alpha=0.5)
+        
+        ax.set_xlabel('Integrated Intensity (cps)')
+        ax.set_ylabel('Pb Concentration (ppm)')
+        ax.set_title(f"{cal_name} (R² = {results['r_squared']:.6f})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Set reasonable axis limits
+        ax.set_xlim(0, max(results['intensities']) * 1.1)
+        ax.set_ylim(0, max(results['concentrations']) * 1.1)
+        
+        self.calibration_plot.draw()
+    
+    def perform_validation(self):
+        """Perform validation analysis"""
+        if not self.calibration_results:
+            return
+        
+        results = self.calibration_results
+        
+        # Calculate machine-dependent quality thresholds based on standards performance
+        std_rsds = []
+        for std_name, std_data in self.standards_data.items():
+            if std_data['rsd'] > 0:
+                std_rsds.append(std_data['rsd'])
+        
+        if std_rsds:
+            # Use the average RSD of standards as baseline, with some tolerance
+            avg_rsd = np.mean(std_rsds)
+            max_rsd = np.max(std_rsds)
+            
+            # Set quality thresholds based on actual instrument performance
+            excellent_threshold = avg_rsd * 0.8  # 20% better than average
+            good_threshold = avg_rsd * 1.2       # 20% worse than average
+            acceptable_threshold = max_rsd * 1.5  # 50% worse than worst standard
+        else:
+            # Fallback to reasonable defaults if no standards data
+            excellent_threshold = 3.0
+            good_threshold = 5.0
+            acceptable_threshold = 8.0
+        
+        # Quality assessment for calibration fit
+        r_squared = results['r_squared']
+        if r_squared >= 0.995:
+            quality = "Excellent"
+            quality_color = "green"
+        elif r_squared >= 0.99:
+            quality = "Good"
+            quality_color = "orange"
+        elif r_squared >= 0.98:
+            quality = "Acceptable"
+            quality_color = "orange"
+        else:
+            quality = "Poor"
+            quality_color = "red"
+        
+        # Calculate recovery for each standard
+        recovery_text = ""
+        all_recoveries_good = True
+        
+        for std_name, std_data in self.standards_data.items():
+            predicted_conc = results['slope'] * std_data['mean'] + results['intercept']
+            recovery = (predicted_conc / std_data['concentration']) * 100
+            recovery_text += f"• {std_name}: {recovery:.1f}% recovery\n"
+            
+            if recovery < 95 or recovery > 105:
+                all_recoveries_good = False
+        
+        # Precision assessment using dynamic thresholds
+        rsd_2586 = self.standards_data['SRM_2586']['rsd']
+        rsd_2587 = self.standards_data['SRM_2587']['rsd']
+        max_rsd = max(rsd_2586, rsd_2587)
+        precision_good = max_rsd <= acceptable_threshold
+        
+        # Overall recommendation
+        if r_squared >= 0.995 and all_recoveries_good and precision_good:
+            recommendation = "✅ RECOMMENDED: This calibration meets all quality criteria."
+            rec_color = "green"
+        elif r_squared >= 0.99 and (all_recoveries_good or precision_good):
+            recommendation = "⚠️ ACCEPTABLE: This calibration meets most quality criteria."
+            rec_color = "orange"
+        else:
+            recommendation = "❌ NOT RECOMMENDED: This calibration has quality issues."
+            rec_color = "red"
+        
+        validation_text = f"""
+Calibration Validation Report
+============================
+
+R-squared Quality Assessment:
+• Value: {r_squared:.6f}
+• Rating: {quality}
+• Criterion: ≥0.995 (Excellent), ≥0.99 (Good), ≥0.98 (Acceptable)
+
+Standard Recovery Analysis:
+{recovery_text}• Target Range: 95-105%
+
+Precision Assessment (Machine-Dependent):
+• SRM 2586 RSD: {rsd_2586:.1f}%
+• SRM 2587 RSD: {rsd_2587:.1f}%
+• Average Standards RSD: {avg_rsd:.1f}%
+• Maximum Standards RSD: {max_rsd:.1f}%
+• Acceptable Threshold: {acceptable_threshold:.1f}% (based on your instrument performance)
+
+Overall Recommendation:
+{recommendation}
+
+Quality Criteria Summary:
+• R-squared ≥ 0.995: {'✅' if r_squared >= 0.995 else '❌'}
+• Recovery 95-105%: {'✅' if all_recoveries_good else '❌'}
+• RSD ≤ {acceptable_threshold:.1f}%: {'✅' if precision_good else '❌'}
+        """
+        
+        self.validation_text.setPlainText(validation_text.strip())
+    
+    def save_calibration(self):
+        """Save the custom calibration to file"""
+        if not self.calibration_results:
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Custom Calibration",
+            "custom_calibration.json",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                # Prepare save data
+                save_data = {
+                    'calibration': self.calibration_results,
+                    'standards_data': {},
+                    'calibration_name': self.calibration_name_edit.text().strip()
+                }
+                
+                # Clean standards data for saving
+                for std_name, std_data in self.standards_data.items():
+                    save_data['standards_data'][std_name] = {
+                        'files': std_data['files'],
+                        'intensities': std_data['intensities'],
+                        'mean': std_data['mean'],
+                        'std': std_data['std'],
+                        'rsd': std_data['rsd'],
+                        'concentration': std_data['concentration']
+                    }
+                
+                # Convert numpy arrays to lists for JSON serialization
+                if 'concentrations' in save_data['calibration']:
+                    save_data['calibration']['concentrations'] = save_data['calibration']['concentrations'].tolist()
+                if 'intensities' in save_data['calibration']:
+                    save_data['calibration']['intensities'] = save_data['calibration']['intensities'].tolist()
+                
+                # Save to file
+                with open(file_path, 'w') as f:
+                    json.dump(save_data, f, indent=2)
+                
+                QMessageBox.information(self, "Success", f"Calibration saved to {file_path}")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Error saving calibration: {e}")
+    
+    def load_calibration(self):
+        """Load a custom calibration from file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Custom Calibration",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'r') as f:
+                    save_data = json.load(f)
+                
+                # Load calibration results
+                self.calibration_results = save_data['calibration']
+                
+                # Load calibration name if available
+                if 'calibration_name' in save_data:
+                    self.calibration_name_edit.setText(save_data['calibration_name'])
+                    self.calibration_results['name'] = save_data['calibration_name']
+                
+                # Convert lists back to numpy arrays
+                if 'concentrations' in self.calibration_results:
+                    self.calibration_results['concentrations'] = np.array(self.calibration_results['concentrations'])
+                if 'intensities' in self.calibration_results:
+                    self.calibration_results['intensities'] = np.array(self.calibration_results['intensities'])
+                
+                # Load standards data
+                for std_name, std_data in save_data['standards_data'].items():
+                    if std_name in self.standards_data:
+                        self.standards_data[std_name].update(std_data)
+                        self.update_file_list(std_name)
+                        self.update_standard_results(std_name)
+                
+                # Update displays
+                self.update_calibration_display()
+                self.create_calibration_plot()
+                self.perform_validation()
+                
+                # Enable buttons
+                self.save_btn.setEnabled(True)
+                self.apply_btn.setEnabled(True)
+                self.calc_btn.setEnabled(True)
+                
+                QMessageBox.information(self, "Success", f"Calibration loaded from {file_path}")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", f"Error loading calibration: {e}")
+    
+    def apply_calibration(self):
+        """Apply the custom calibration to the main application"""
+        if not self.calibration_results:
+            return
+        
+        try:
+            # Get the main application
+            main_app = self.parent()
+            
+            # Update the peak fitter in the main application (try both possible names)
+            main_fitter = None
+            if hasattr(main_app, 'fitter'):
+                main_fitter = main_app.fitter
+            elif hasattr(main_app, 'peak_fitter'):
+                main_fitter = main_app.peak_fitter
+            
+            if main_fitter:
+                # Update the calibration parameters
+                main_fitter.calibration_slope = self.calibration_results['slope']
+                main_fitter.calibration_intercept = self.calibration_results['intercept']
+                main_fitter.calibration_name = self.calibration_results.get('name', 'Custom Calibration')
+                
+                # Update calibration display in main GUI
+                if hasattr(main_app, 'calibration_slope_edit'):
+                    main_app.calibration_slope_edit.setText(f"{self.calibration_results['slope']:.2e}")
+                if hasattr(main_app, 'calibration_intercept_edit'):
+                    main_app.calibration_intercept_edit.setText(f"{self.calibration_results['intercept']:.2f}")
+                
+                # Recalculate concentrations for existing data with new calibration
+                if hasattr(main_app, 'batch_results') and main_app.batch_results:
+                    print("Recalculating concentrations with new calibration...")
+                    for result in main_app.batch_results:
+                        # Recalculate concentration using new calibration
+                        new_concentration = main_fitter.apply_calibration(result['integrated_intensity'])
+                        result['concentration'] = new_concentration
+                    
+                    # Recalculate sample groups with new concentrations
+                    if hasattr(main_app, 'sample_groups') and main_app.sample_groups:
+                        for sample_group in main_app.sample_groups:
+                            # Update sample group data with new concentrations
+                            updated_data = []
+                            for filename, fit_params, intensity, old_conc in sample_group.spectra_data:
+                                new_conc = main_fitter.apply_calibration(intensity)
+                                updated_data.append((filename, fit_params, intensity, new_conc))
+                            
+                            # Replace the data and recalculate statistics
+                            sample_group.spectra_data = updated_data
+                            sample_group.calculate_statistics()
+                    
+                    # Refresh the plots with new concentrations
+                    if hasattr(main_app, 'plot_canvas') and hasattr(main_app, 'sample_groups'):
+                        main_app.plot_canvas.plot_sample_statistics(main_app.sample_groups)
+                    
+                    # Refresh results table display if it exists
+                    if hasattr(main_app, 'display_sample_statistics'):
+                        main_app.display_sample_statistics(main_app.sample_groups)
+                
+                # Update single file results if available
+                if hasattr(main_app, 'current_data') and main_app.current_data:
+                    # Recalculate current file if it exists
+                    try:
+                        result = main_app.current_data
+                        if 'integrated_intensity' in result:
+                            new_concentration = main_fitter.apply_calibration(result['integrated_intensity'])
+                            result['concentration'] = new_concentration
+                            
+                            # Update display
+                            if hasattr(main_app, 'display_fit_results'):
+                                main_app.display_fit_results(
+                                    result['fit_params'], 
+                                    result['r_squared'], 
+                                    result['integrated_intensity'], 
+                                    new_concentration
+                                )
+                    except Exception as e:
+                        print(f"Could not update single file results: {e}")
+                
+                # Update calibration verification plot
+                if hasattr(main_app, 'plot_canvas'):
+                    # Update the plot title to show custom calibration
+                    main_plot = main_app.plot_canvas
+                    if hasattr(main_plot, 'ax1') and main_plot.ax1:
+                        title = main_plot.ax1.get_title()
+                        if "NIST Calibration" in title:
+                            new_title = title.replace("NIST Calibration", "Custom Calibration")
+                            main_plot.ax1.set_title(new_title)
+                            main_plot.draw()
+                
+                QMessageBox.information(
+                    self, 
+                    "Applied", 
+                    "Custom calibration has been applied to the analysis.\n\n"
+                    f"New calibration equation:\n"
+                    f"Concentration = {self.calibration_results['slope']:.6f} × Intensity + {self.calibration_results['intercept']:.2f}"
+                )
+                
+                self.accept()
+                
+            else:
+                QMessageBox.warning(self, "Error", "Could not access main application peak fitter.")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Apply Error", f"Error applying calibration: {e}")
+
+
 class ProtocolDialog(QDialog):
     """Dialog for displaying the XRF SOP with markdown formatting"""
     
@@ -2439,6 +3382,315 @@ class ProtocolDialog(QDialog):
         """
         
         return html
+
+def detect_file_format(file_path):
+    """
+    Detect the format of an XRF data file by examining its content.
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the file to analyze
+        
+    Returns:
+    --------
+    format_type : str
+        Detected format: 'emsa', 'nist_standard', 'csv', 'excel', 'space_separated', 'tab_separated', 'unknown'
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Read first 50 lines to analyze format
+            lines = [f.readline().strip() for _ in range(50)]
+        
+        # Check for EMSA format
+        emsa_indicators = ['#FORMAT', '#VERSION', '#SPECTRUM', '#NPOINTS', '#XUNITS']
+        if any(indicator in lines[0] for indicator in emsa_indicators):
+            return 'emsa'
+        
+        # Check for NIST standard format
+        nist_indicators = ['B-Baseline', 'Spectral	Data	File', 'Data	Starts	Here']
+        if any(indicator in ' '.join(lines[:20]) for indicator in nist_indicators):
+            return 'nist_standard'
+        
+        # Find the first non-comment line to analyze format
+        data_line = None
+        for line in lines:
+            if line and not line.startswith('#'):
+                data_line = line
+                break
+        
+        if data_line:
+            # Check for CSV format (comma-separated)
+            if ',' in data_line:
+                return 'csv'
+            
+            # Check for tab-separated format
+            if '\t' in data_line:
+                return 'tab_separated'
+            
+            # Check for space-separated format
+            if len(data_line.split()) >= 2:
+                return 'space_separated'
+        
+        return 'unknown'
+        
+    except Exception as e:
+        print(f"Error detecting file format for {file_path}: {e}")
+        return 'unknown'
+
+def parse_xrf_file_smart(file_path):
+    """
+    Smart parser for XRF data files that automatically detects and handles various formats.
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the XRF data file
+        
+    Returns:
+    --------
+    x : numpy.array
+        Energy values (keV)
+    y : numpy.array
+        Intensity values (counts)
+    format_detected : str
+        The detected format type
+    """
+    try:
+        # Detect file format
+        format_type = detect_file_format(file_path)
+        print(f"Detected format for {os.path.basename(file_path)}: {format_type}")
+        
+        if format_type == 'emsa':
+            # Use existing EMSA parser
+            metadata, spectrum_df = parse_emsa_file_pandas(file_path)
+            if spectrum_df is not None and len(spectrum_df) > 0:
+                x = spectrum_df['energy_kev'].values
+                y = spectrum_df['counts'].values
+                return x, y, format_type
+        
+        elif format_type == 'nist_standard':
+            # Parse NIST standard format with header and 3 columns
+            return parse_nist_standard_format(file_path, format_type)
+        
+        elif format_type == 'csv':
+            # Parse CSV format
+            return parse_csv_format(file_path, format_type)
+        
+        elif format_type == 'tab_separated':
+            # Parse tab-separated format
+            return parse_tab_separated_format(file_path, format_type)
+        
+        elif format_type == 'space_separated':
+            # Parse space-separated format
+            return parse_space_separated_format(file_path, format_type)
+        
+        else:
+            # Try fallback parsing methods
+            return parse_fallback_format(file_path, format_type)
+            
+    except Exception as e:
+        print(f"Error in smart parsing of {file_path}: {e}")
+        return None, None, 'error'
+
+def parse_nist_standard_format(file_path, format_type):
+    """Parse NIST standard files with header and 3 columns"""
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+        
+        data_lines = []
+        in_data_section = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Check for data section start
+            if "Data Starts Here" in line or "Data	Starts	Here" in line:
+                in_data_section = True
+                continue
+            
+            # Parse data lines (should have 3 columns: energy, intensity, baseline)
+            if in_data_section:
+                # Split by tabs or spaces
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        energy = float(parts[0])
+                        intensity = float(parts[1])
+                        data_lines.append([energy, intensity])
+                    except ValueError:
+                        # Skip lines that can't be parsed as numbers
+                        continue
+        
+        if not data_lines:
+            raise ValueError("No valid data found in file")
+        
+        # Convert to numpy arrays
+        data_array = np.array(data_lines)
+        x = data_array[:, 0]
+        y = data_array[:, 1]
+        
+        return x, y, format_type
+        
+    except Exception as e:
+        print(f"Error parsing NIST standard format {file_path}: {e}")
+        return None, None, format_type
+
+def parse_csv_format(file_path, format_type):
+    """Parse CSV format files with mixed header and data content"""
+    try:
+        # Read file line by line to handle mixed content
+        data_lines = []
+        in_data_section = False
+        
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                
+                # Skip empty lines
+                if not line:
+                    continue
+                
+                # Check for data section start
+                if "Data begins below" in line or "Data starts below" in line:
+                    in_data_section = True
+                    continue
+                
+                # Parse data lines (should have 2 columns: energy, intensity)
+                if in_data_section and not line.startswith('#'):
+                    # Split by comma and clean up
+                    parts = [part.strip() for part in line.split(',')]
+                    if len(parts) >= 2:
+                        try:
+                            energy = float(parts[0])
+                            intensity = float(parts[1])
+                            data_lines.append([energy, intensity])
+                        except ValueError:
+                            # Skip lines that can't be parsed as numbers
+                            continue
+        
+        if not data_lines:
+            # If no data section found, try to parse the whole file
+            try:
+                df = pd.read_csv(file_path, header=None)
+                
+                # Find the first two numeric columns
+                numeric_cols = []
+                for col in df.columns:
+                    if df[col].dtype in ['float64', 'int64'] or df[col].apply(lambda x: pd.to_numeric(x, errors='coerce')).notna().any():
+                        numeric_cols.append(col)
+                        if len(numeric_cols) == 2:
+                            break
+                
+                if len(numeric_cols) >= 2:
+                    x = df[numeric_cols[0]].values
+                    y = df[numeric_cols[1]].values
+                    return x, y, format_type
+            except:
+                pass
+            
+            raise ValueError("No valid data found in file")
+        
+        # Convert to numpy arrays
+        data_array = np.array(data_lines)
+        x = data_array[:, 0]
+        y = data_array[:, 1]
+        
+        return x, y, format_type
+        
+    except Exception as e:
+        print(f"Error parsing CSV format {file_path}: {e}")
+        return None, None, format_type
+
+def parse_tab_separated_format(file_path, format_type):
+    """Parse tab-separated format files"""
+    try:
+        df = pd.read_csv(file_path, delimiter='\t', header=None)
+        
+        # Find the first two numeric columns
+        numeric_cols = []
+        for col in df.columns:
+            if df[col].dtype in ['float64', 'int64'] or df[col].apply(lambda x: pd.to_numeric(x, errors='coerce')).notna().any():
+                numeric_cols.append(col)
+                if len(numeric_cols) == 2:
+                    break
+        
+        if len(numeric_cols) >= 2:
+            x = df[numeric_cols[0]].values
+            y = df[numeric_cols[1]].values
+            return x, y, format_type
+        else:
+            raise ValueError("Could not find two numeric columns")
+            
+    except Exception as e:
+        print(f"Error parsing tab-separated format {file_path}: {e}")
+        return None, None, format_type
+
+def parse_space_separated_format(file_path, format_type):
+    """Parse space-separated format files"""
+    try:
+        df = pd.read_csv(file_path, delimiter=r'\s+', header=None)
+        
+        # Find the first two numeric columns
+        numeric_cols = []
+        for col in df.columns:
+            if df[col].dtype in ['float64', 'int64'] or df[col].apply(lambda x: pd.to_numeric(x, errors='coerce')).notna().any():
+                numeric_cols.append(col)
+                if len(numeric_cols) == 2:
+                    break
+        
+        if len(numeric_cols) >= 2:
+            x = df[numeric_cols[0]].values
+            y = df[numeric_cols[1]].values
+            return x, y, format_type
+        else:
+            raise ValueError("Could not find two numeric columns")
+            
+    except Exception as e:
+        print(f"Error parsing space-separated format {file_path}: {e}")
+        return None, None, format_type
+
+def parse_fallback_format(file_path, format_type):
+    """Fallback parsing for unknown formats"""
+    try:
+        # Try multiple parsing strategies
+        strategies = [
+            lambda: pd.read_csv(file_path, header=None),
+            lambda: pd.read_csv(file_path, delimiter='\t', header=None),
+            lambda: pd.read_csv(file_path, delimiter=r'\s+', header=None),
+            lambda: pd.read_csv(file_path, delimiter=',', header=None)
+        ]
+        
+        for i, strategy in enumerate(strategies):
+            try:
+                df = strategy()
+                
+                # Find the first two numeric columns
+                numeric_cols = []
+                for col in df.columns:
+                    if df[col].dtype in ['float64', 'int64'] or df[col].apply(lambda x: pd.to_numeric(x, errors='coerce')).notna().any():
+                        numeric_cols.append(col)
+                        if len(numeric_cols) == 2:
+                            break
+                
+                if len(numeric_cols) >= 2:
+                    x = df[numeric_cols[0]].values
+                    y = df[numeric_cols[1]].values
+                    return x, y, f'fallback_{i}'
+                    
+            except Exception:
+                continue
+        
+        raise ValueError("No parsing strategy worked")
+        
+    except Exception as e:
+        print(f"Error in fallback parsing of {file_path}: {e}")
+        return None, None, format_type
 
 def parse_emsa_file_pandas(filename):
     """
