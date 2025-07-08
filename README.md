@@ -52,17 +52,6 @@ For questions, bug reports, or feature requests, contact:
 **Aaron Celestian**  
 Email: acelestian@nhm.org
 
-## Screenshots
-
-### Main Application Window
-![Main Application Window](screenshots/main_window.png)
-
-### PDF Report Example
-![PDF Report Example](screenshots/pdf_report.png)
-
-### SOP Viewer in Application
-![SOP Viewer](screenshots/sop_viewer.png)
-
 ---
 
 © 2025 Natural History Museum of Los Angeles County. All rights reserved. 
