@@ -1,0 +1,7 @@
+PySide6
+matplotlib
+numpy
+pandas
+scipy
+reportlab
+python-docx 
