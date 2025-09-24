@@ -1,7 +1,7 @@
 # XRF_Pb: XRF Peak Fitting and Quantitative Analysis
 
 ## Overview
-Born from the Prospering backyards (Pb) project,XRF_Pb is a user-friendly desktop application for batch and single-file X-ray fluorescence (XRF) analysis of lead (Pb) in pressed pellets. It provides robust peak fitting, background subtraction, NIST-based calibration, and comprehensive reporting for laboratory and research use.
+Born from the Prospering backyards (Pb) project, XRF_Pb is a user-friendly desktop application for batch and single-file X-ray fluorescence (XRF) analysis of lead (Pb) in pressed pellets. It provides robust peak fitting, background subtraction, NIST-based calibration, and comprehensive reporting for laboratory and research use.
 
 ## Features
 - **Batch and Single Spectrum Analysis**
