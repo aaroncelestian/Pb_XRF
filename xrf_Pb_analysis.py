@@ -1,27 +1,23 @@
 import sys
 import os
-import re
 import json
+import re
 import numpy as np
 import pandas as pd
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                               QWidget, QPushButton, QFileDialog, QLabel, QLineEdit,
-                               QTextEdit, QProgressBar, QGridLayout, QGroupBox,
-                               QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
-                               QTableWidget, QTableWidgetItem, QTabWidget,
-                               QMessageBox, QSplitter, QScrollArea, QDialog,
-                               QDialogButtonBox, QTextBrowser, QProgressDialog,
-                               QListWidget)
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont
+from datetime import datetime
+
+# macOS compatibility fixes
+if sys.platform == 'darwin':  # macOS
+    # Set environment variables for Qt on macOS
+    os.environ['QT_MAC_WANTS_LAYER'] = '1'
+    # Fix for macOS Big Sur and later Qt issues
+    os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '1'
+
+# Set matplotlib to use Qt backend for PySide6 compatibility
+import matplotlib
+matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
-try:
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-except ImportError:
-    try:
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-    except ImportError:
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
@@ -30,6 +26,284 @@ import warnings
 warnings.filterwarnings('ignore')
 from pathlib import Path
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                               QHBoxLayout, QGridLayout, QPushButton, QLabel, 
+                               QSpinBox, QDoubleSpinBox, QTextEdit, QFileDialog, 
+                               QMessageBox, QProgressBar, QCheckBox, QGroupBox,
+                               QTabWidget, QTableWidget, QTableWidgetItem, QComboBox,
+                               QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpacerItem, QSizePolicy,
+                               QSplitter)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QFont, QColor
+
+class CalibrationManager:
+    """Manages persistent storage and retrieval of element calibrations"""
+    
+    def __init__(self, calibration_file="xrf_calibrations.json"):
+        self.calibration_file = calibration_file
+        self.calibrations = self.load_calibrations()
+    
+    def load_calibrations(self):
+        """Load calibrations from file"""
+        if os.path.exists(self.calibration_file):
+            try:
+                with open(self.calibration_file, 'r') as f:
+                    data = json.load(f)
+                print(f"Loaded calibrations from {self.calibration_file}")
+                return data
+            except Exception as e:
+                print(f"Error loading calibrations: {e}")
+                return {}
+        return {}
+    
+    def save_calibrations(self):
+        """Save calibrations to file"""
+        try:
+            with open(self.calibration_file, 'w') as f:
+                json.dump(self.calibrations, f, indent=2)
+            print(f"Saved calibrations to {self.calibration_file}")
+        except Exception as e:
+            print(f"Error saving calibrations: {e}")
+    
+    def update_calibration(self, element, slope, intercept, r_squared=None, standards_used=None):
+        """Update calibration for an element"""
+        if element not in self.calibrations:
+            self.calibrations[element] = {}
+        
+        self.calibrations[element].update({
+            'slope': float(slope),
+            'intercept': float(intercept),
+            'r_squared': float(r_squared) if r_squared is not None else None,
+            'standards_used': standards_used if standards_used else [],
+            'created_date': datetime.now().isoformat(),
+            'equation': f"Concentration = {slope:.4f} × Intensity + {intercept:.4f}"
+        })
+        
+        self.save_calibrations()
+        print(f"Updated calibration for {element}")
+    
+    def get_calibration(self, element):
+        """Get calibration for an element"""
+        return self.calibrations.get(element, None)
+    
+    def has_calibration(self, element):
+        """Check if element has a calibration"""
+        return element in self.calibrations
+    
+    def get_all_calibrations(self):
+        """Get all calibrations"""
+        return self.calibrations.copy()
+    
+    def delete_calibration(self, element):
+        """Delete calibration for an element"""
+        if element in self.calibrations:
+            del self.calibrations[element]
+            self.save_calibrations()
+            print(f"Deleted calibration for {element}")
+    
+    def export_calibrations(self, filename):
+        """Export calibrations to a file"""
+        try:
+            with open(filename, 'w') as f:
+                json.dump(self.calibrations, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error exporting calibrations: {e}")
+            return False
+    
+    def import_calibrations(self, filename):
+        """Import calibrations from a file"""
+        try:
+            with open(filename, 'r') as f:
+                imported = json.load(f)
+            self.calibrations.update(imported)
+            self.save_calibrations()
+            return True
+        except Exception as e:
+            print(f"Error importing calibrations: {e}")
+            return False
+
+# Element definitions for XRF analysis
+ELEMENT_DEFINITIONS = {
+    'Pb': {
+        'name': 'Lead',
+        'symbol': 'Pb',
+        'primary_energy': 10.55,  # Pb L-alpha
+        'secondary_energy': 12.61,  # Pb L-beta
+        'peak_region': (10.0, 11.0),
+        'integration_region': (9.8, 11.2),
+        'default_calibration': {'slope': 13.8913, 'intercept': 0.0}
+    },
+    'As': {
+        'name': 'Arsenic',
+        'symbol': 'As',
+        'primary_energy': 10.54,  # As K-alpha
+        'secondary_energy': 11.73,  # As K-beta
+        'peak_region': (10.0, 11.0),
+        'integration_region': (9.8, 11.2),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Cd': {
+        'name': 'Cadmium',
+        'symbol': 'Cd',
+        'primary_energy': 23.17,  # Cd K-alpha
+        'secondary_energy': 26.10,  # Cd K-beta
+        'peak_region': (22.5, 24.0),
+        'integration_region': (22.0, 24.5),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Cr': {
+        'name': 'Chromium',
+        'symbol': 'Cr',
+        'primary_energy': 5.41,  # Cr K-alpha
+        'secondary_energy': 5.95,  # Cr K-beta
+        'peak_region': (5.0, 6.0),
+        'integration_region': (4.8, 6.2),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Zn': {
+        'name': 'Zinc',
+        'symbol': 'Zn',
+        'primary_energy': 8.64,  # Zn K-alpha
+        'secondary_energy': 9.57,  # Zn K-beta
+        'peak_region': (8.2, 9.2),
+        'integration_region': (8.0, 9.4),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Ni': {
+        'name': 'Nickel',
+        'symbol': 'Ni',
+        'primary_energy': 7.48,  # Ni K-alpha
+        'secondary_energy': 8.26,  # Ni K-beta
+        'peak_region': (7.0, 8.0),
+        'integration_region': (6.8, 8.2),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Cu': {
+        'name': 'Copper',
+        'symbol': 'Cu',
+        'primary_energy': 8.05,  # Cu K-alpha
+        'secondary_energy': 8.91,  # Cu K-beta
+        'peak_region': (7.6, 8.6),
+        'integration_region': (7.4, 8.8),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Fe': {
+        'name': 'Iron',
+        'symbol': 'Fe',
+        'primary_energy': 6.40,  # Fe K-alpha
+        'secondary_energy': 7.06,  # Fe K-beta
+        'peak_region': (6.0, 7.0),
+        'integration_region': (5.8, 7.2),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'Se': {
+        'name': 'Selenium',
+        'symbol': 'Se',
+        'primary_energy': 11.22,  # Se K-alpha
+        'secondary_energy': 12.50,  # Se K-beta
+        'peak_region': (10.8, 11.8),
+        'integration_region': (10.6, 12.0),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    },
+    'S': {
+        'name': 'Sulfur',
+        'symbol': 'S',
+        'primary_energy': 2.31,  # S K-alpha
+        'secondary_energy': 2.46,  # S K-beta
+        'peak_region': (2.0, 2.8),
+        'integration_region': (1.8, 3.0),
+        'default_calibration': {'slope': 1.0, 'intercept': 0.0}
+    }
+}
+
+# Reference material data from the user's table
+REFERENCE_MATERIALS = {
+    'Till 1': {
+        'S': '<0.05%',  # Special case - below detection limit
+        'As': 18,
+        'Cd': None,
+        'Cr': 65,
+        'Zn': 98,
+        'Ni': 24,
+        'Cu': 47,
+        'Pb': 22,
+        'Fe': '4.81%',
+        'Se': None
+    },
+    'LKSD 1': {
+        'S': '1.57%',
+        'As': 40,
+        'Cd': None,
+        'Cr': 31,
+        'Zn': 331,
+        'Ni': 16,
+        'Cu': 44,
+        'Pb': 82,
+        'Fe': '2.8%',
+        'Se': None
+    },
+    'PACS 2': {
+        'S': '1',  # Assuming this is 1%
+        'As': 26.2,
+        'Cd': 2.11,
+        'Cr': 90.7,
+        'Zn': 364,
+        'Ni': 39.5,
+        'Cu': 310,
+        'Pb': 183,
+        'Fe': '4.09',  # Assuming this is 4.09%
+        'Se': 0.92
+    },
+    'STDS 2': {
+        'S': '0.06%',
+        'As': 42,
+        'Cd': None,
+        'Cr': 116,
+        'Zn': 246,
+        'Ni': 53,
+        'Cu': 47,
+        'Pb': 66,
+        'Fe': '5.2%',
+        'Se': None
+    },
+    'NIST 2586': {
+        'S': '600',  # Assuming ppm
+        'As': 8.7,
+        'Cd': 2.71,
+        'Cr': 301,
+        'Zn': 352,
+        'Ni': None,
+        'Cu': None,
+        'Pb': 432,
+        'Fe': '51610',  # Assuming ppm
+        'Se': None
+    },
+    'NIST 2587': {
+        'S': None,
+        'As': 13.7,
+        'Cd': 1.92,
+        'Cr': 92,
+        'Zn': 335.8,
+        'Ni': None,
+        'Cu': None,
+        'Pb': 3242,
+        'Fe': '28130',  # Assuming ppm
+        'Se': None
+    },
+    'NBS 1633': {
+        'S': None,
+        'As': None,
+        'Cd': None,
+        'Cr': None,
+        'Zn': None,
+        'Ni': None,
+        'Cu': None,
+        'Pb': None,
+        'Fe': None,
+        'Se': None
+    }
+}
 
 # Import matplotlib configuration
 try:
@@ -314,13 +588,44 @@ class FileSortingDialog(QDialog):
 class XRFPeakFitter:
     """Core class for XRF peak fitting with background subtraction and Gaussian-A fitting"""
     
-    def __init__(self):
-        self.target_energy = 10.5  # Pb L-alpha peak at 10.5 keV
-        # NIST calibration parameters
-        self.calibration_slope = 13.8913
-        self.calibration_intercept = 0.0
+    def __init__(self, element='Pb'):
+        self.current_element = element
+        self.element_data = ELEMENT_DEFINITIONS.get(element, ELEMENT_DEFINITIONS['Pb'])
+        
+        self.target_energy = self.element_data['primary_energy']
+        # Calibration parameters
+        self.calibration_slope = self.element_data['default_calibration']['slope']
+        self.calibration_intercept = self.element_data['default_calibration']['intercept']
         # Custom calibration name
-        self.calibration_name = "NIST Calibration"
+        self.calibration_name = f"{element} Default Calibration"
+        
+        # Element-specific calibrations storage
+        self.element_calibrations = {element: {'slope': self.calibration_slope, 'intercept': self.calibration_intercept}}
+    
+    def set_element(self, element):
+        """Switch to a different element"""
+        if element in ELEMENT_DEFINITIONS:
+            self.current_element = element
+            self.element_data = ELEMENT_DEFINITIONS[element]
+            self.target_energy = self.element_data['primary_energy']
+            
+            # Load calibration for this element
+            if element in self.element_calibrations:
+                self.calibration_slope = self.element_calibrations[element]['slope']
+                self.calibration_intercept = self.element_calibrations[element]['intercept']
+            else:
+                self.calibration_slope = self.element_data['default_calibration']['slope']
+                self.calibration_intercept = self.element_data['default_calibration']['intercept']
+                self.element_calibrations[element] = {'slope': self.calibration_slope, 'intercept': self.calibration_intercept}
+            
+            self.calibration_name = f"{element} Calibration"
+    
+    def update_element_calibration(self, element, slope, intercept):
+        """Update calibration parameters for a specific element"""
+        self.element_calibrations[element] = {'slope': slope, 'intercept': intercept}
+        if element == self.current_element:
+            self.calibration_slope = slope
+            self.calibration_intercept = intercept
         
     def gaussian_a(self, x, a, x0, dx):
         """
@@ -424,10 +729,10 @@ class XRFPeakFitter:
         - concentration: calibrated concentration
         """
         if peak_region is None:
-            peak_region = (self.target_energy - 0.5, self.target_energy + 0.5)
+            peak_region = self.element_data['peak_region']
         
         if integration_region is None:
-            integration_region = peak_region
+            integration_region = self.element_data['integration_region']
         
         # Select fitting region
         mask = (x >= peak_region[0]) & (x <= peak_region[1])
@@ -960,6 +1265,170 @@ class ProcessingThread(QThread):
             print(f"Error reading {file_path}: {e}")
             return None
 
+class MultiElementProcessingThread(QThread):
+    """Thread for multi-element batch processing of XRF files"""
+    
+    progress = Signal(int)
+    error_occurred = Signal(str, str)
+    finished = Signal(list, list)
+    
+    def __init__(self, file_paths, fitting_params, spectra_per_sample):
+        super().__init__()
+        self.file_paths = file_paths
+        self.fitting_params = fitting_params
+        self.spectra_per_sample = spectra_per_sample
+        self.selected_elements = fitting_params.get('selected_elements', ['Pb'])
+        
+        # Create fitters for each selected element
+        self.element_fitters = {}
+        for element in self.selected_elements:
+            self.element_fitters[element] = XRFPeakFitter(element=element)
+    
+    def run(self):
+        """Process all files for all selected elements"""
+        results = []
+        sample_groups = []
+        
+        try:
+            for i, file_path in enumerate(self.file_paths):
+                try:
+                    # Read XRF data once
+                    data = self.read_xrf_file(file_path)
+                    
+                    if data is None:
+                        self.error_occurred.emit(file_path, "Could not read file")
+                        continue
+                    
+                    x, y = data
+                    
+                    # Analyze each selected element
+                    element_results = {}
+                    
+                    for element in self.selected_elements:
+                        try:
+                            fitter = self.element_fitters[element]
+                            
+                            # Use element-specific regions or fallback to UI parameters
+                            element_data = ELEMENT_DEFINITIONS[element]
+                            peak_region = element_data['peak_region']
+                            integration_region = element_data['integration_region']
+                            
+                            # Fit peak for this element
+                            fit_params, fit_curve, r_squared, x_fit, integrated_intensity, concentration = fitter.fit_peak(
+                                x, y, 
+                                peak_region=peak_region,
+                                background_subtract=self.fitting_params['background_subtract'],
+                                integration_region=integration_region
+                            )
+                            
+                            element_results[element] = {
+                                'fit_params': fit_params,
+                                'r_squared': r_squared,
+                                'integrated_intensity': integrated_intensity,
+                                'concentration': concentration,
+                                'fit_x': x_fit,
+                                'fit_y': fit_curve
+                            }
+                            
+                        except Exception as e:
+                            # If one element fails, continue with others
+                            element_results[element] = {
+                                'error': str(e),
+                                'fit_params': None,
+                                'r_squared': 0,
+                                'integrated_intensity': 0,
+                                'concentration': 0
+                            }
+                    
+                    # Store multi-element results
+                    result = {
+                        'filename': os.path.basename(file_path),
+                        'filepath': file_path,
+                        'x_data': x,
+                        'y_data': y,
+                        'element_results': element_results,
+                        'selected_elements': self.selected_elements
+                    }
+                    
+                    results.append(result)
+                    
+                    # Emit progress
+                    progress_value = min(98, int((i + 1) / len(self.file_paths) * 98))
+                    self.progress.emit(progress_value)
+                    
+                except Exception as e:
+                    self.error_occurred.emit(file_path, str(e))
+                    progress_value = min(98, int((i + 1) / len(self.file_paths) * 98))
+                    self.progress.emit(progress_value)
+            
+            # Group results by sample
+            self.progress.emit(99)
+            sample_groups = self.group_by_sample_multi_element(results)
+            
+            # Emit finished signal
+            self.finished.emit(results, sample_groups)
+            
+        except Exception as e:
+            self.error_occurred.emit("THREAD_ERROR", f"Unexpected error in multi-element processing: {str(e)}")
+            self.finished.emit(results, sample_groups)
+    
+    def group_by_sample_multi_element(self, results):
+        """Group multi-element results by sample"""
+        sample_groups = []
+        
+        for i in range(0, len(results), self.spectra_per_sample):
+            sample_number = (i // self.spectra_per_sample) + 1
+            sample_name = f"Sample_{sample_number}"
+            
+            # Create element-specific sample groups
+            element_sample_groups = {}
+            
+            for element in self.selected_elements:
+                sample_data = []
+                
+                # Get spectra for this sample and element
+                for j in range(i, min(i + self.spectra_per_sample, len(results))):
+                    result = results[j]
+                    element_result = result['element_results'].get(element, {})
+                    
+                    if 'error' not in element_result:
+                        sample_data.append((
+                            result['filename'],
+                            element_result.get('fit_params'),
+                            element_result.get('integrated_intensity', 0),
+                            element_result.get('concentration', 0)
+                        ))
+                
+                if sample_data:
+                    element_sample_groups[element] = SampleGroup(f"{sample_name}_{element}", sample_data)
+            
+            if element_sample_groups:
+                # Store as a multi-element sample group
+                multi_element_group = {
+                    'sample_name': sample_name,
+                    'element_groups': element_sample_groups,
+                    'selected_elements': self.selected_elements
+                }
+                sample_groups.append(multi_element_group)
+        
+        return sample_groups
+    
+    def read_xrf_file(self, file_path):
+        """Read XRF data from various file formats using smart detection"""
+        try:
+            x, y, format_type = parse_xrf_file_smart(file_path)
+            
+            if x is not None and y is not None:
+                print(f"Successfully parsed {os.path.basename(file_path)} as {format_type} format")
+                return x, y
+            else:
+                print(f"Failed to parse {file_path} with smart parser")
+                return None
+                
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            return None
+
 class XRFPeakFittingGUI(QMainWindow):
     """Main GUI application for XRF peak fitting with calibration and sample grouping"""
     
@@ -969,13 +1438,33 @@ class XRFPeakFittingGUI(QMainWindow):
         self.setGeometry(100, 100, 1600, 1000)
         
         # Initialize components
-        self.fitter = XRFPeakFitter()
+        self.calibration_manager = CalibrationManager()
+        self.fitter = XRFPeakFitter()  # Default to Pb
+        self.peak_fitter = XRFPeakFitter()  # For multi-element calibration UI
         self.current_data = None
         self.processing_thread = None
         self.batch_results = []
         self.sample_groups = []
         
+        # Load saved calibrations into fitters
+        self.load_saved_calibrations()
+        
         self.init_ui()
+    
+    def load_saved_calibrations(self):
+        """Load saved calibrations into the fitters"""
+        all_calibrations = self.calibration_manager.get_all_calibrations()
+        
+        for element, cal_data in all_calibrations.items():
+            if element in ELEMENT_DEFINITIONS:
+                slope = cal_data.get('slope', ELEMENT_DEFINITIONS[element]['default_calibration']['slope'])
+                intercept = cal_data.get('intercept', ELEMENT_DEFINITIONS[element]['default_calibration']['intercept'])
+                
+                # Update both fitters
+                self.fitter.update_element_calibration(element, slope, intercept)
+                self.peak_fitter.update_element_calibration(element, slope, intercept)
+                
+                print(f"Loaded calibration for {element}: {slope:.4f}x + {intercept:.4f}")
         
     def init_ui(self):
         """Initialize the user interface"""
@@ -1027,6 +1516,57 @@ class XRFPeakFittingGUI(QMainWindow):
         grouping_layout.addWidget(self.spectra_per_sample_spin, 0, 1)
         
         main_tab_layout.addWidget(grouping_group)
+        
+        # Element selection group
+        element_selection_group = QGroupBox("Elements to Analyze")
+        element_selection_layout = QVBoxLayout(element_selection_group)
+        
+        # Instructions
+        element_info = QLabel("Select which elements to analyze during processing:")
+        element_info.setStyleSheet("QLabel { color: #666; font-style: italic; }")
+        element_selection_layout.addWidget(element_info)
+        
+        # Create checkboxes for each element
+        self.element_checkboxes = {}
+        element_grid = QGridLayout()
+        
+        elements = list(ELEMENT_DEFINITIONS.keys())
+        for i, element in enumerate(elements):
+            element_data = ELEMENT_DEFINITIONS[element]
+            checkbox = QCheckBox(f"{element} ({element_data['name']}) - {element_data['primary_energy']} keV")
+            
+            # Check Pb by default
+            if element == 'Pb':
+                checkbox.setChecked(True)
+            
+            self.element_checkboxes[element] = checkbox
+            
+            # Arrange in 2 columns
+            row = i // 2
+            col = i % 2
+            element_grid.addWidget(checkbox, row, col)
+        
+        element_selection_layout.addLayout(element_grid)
+        
+        # Quick selection buttons
+        quick_select_layout = QHBoxLayout()
+        
+        select_all_elements_btn = QPushButton("Select All")
+        select_all_elements_btn.clicked.connect(self.select_all_elements)
+        quick_select_layout.addWidget(select_all_elements_btn)
+        
+        select_none_elements_btn = QPushButton("Select None")
+        select_none_elements_btn.clicked.connect(self.select_none_elements)
+        quick_select_layout.addWidget(select_none_elements_btn)
+        
+        select_common_elements_btn = QPushButton("Common Elements (Pb, Zn, Cu, Cr)")
+        select_common_elements_btn.clicked.connect(self.select_common_elements)
+        quick_select_layout.addWidget(select_common_elements_btn)
+        
+        quick_select_layout.addStretch()
+        element_selection_layout.addLayout(quick_select_layout)
+        
+        main_tab_layout.addWidget(element_selection_group)
         
         # Processing buttons
         process_group = QGroupBox("Processing")
@@ -1261,6 +1801,226 @@ class XRFPeakFittingGUI(QMainWindow):
         fitting_layout.addWidget(calibration_group)
         fitting_layout.addStretch()
         self.advanced_subtabs.addTab(fitting_tab, "Fitting & Calibration")
+
+        # Multi-Element Calibrations subtab
+        multi_element_tab = QWidget()
+        multi_element_layout = QVBoxLayout(multi_element_tab)
+        
+        # Calibration Status Display
+        calibration_status_group = QGroupBox("Current Calibration Status")
+        calibration_status_layout = QVBoxLayout(calibration_status_group)
+        
+        # Status info
+        status_info = QLabel("Shows the current calibration curves for each element. Green = calibrated, Red = using defaults.")
+        status_info.setStyleSheet("QLabel { color: #666; font-style: italic; margin-bottom: 10px; }")
+        calibration_status_layout.addWidget(status_info)
+        
+        # Calibration status table
+        self.calibration_status_table = QTableWidget()
+        self.setup_calibration_status_table()
+        calibration_status_layout.addWidget(self.calibration_status_table)
+        
+        # Calibration management buttons
+        cal_mgmt_layout = QHBoxLayout()
+        
+        refresh_cal_btn = QPushButton("🔄 Refresh Status")
+        refresh_cal_btn.clicked.connect(self.refresh_calibration_status)
+        refresh_cal_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        cal_mgmt_layout.addWidget(refresh_cal_btn)
+        
+        export_cal_btn = QPushButton("📤 Export Calibrations")
+        export_cal_btn.clicked.connect(self.export_calibrations)
+        cal_mgmt_layout.addWidget(export_cal_btn)
+        
+        import_cal_btn = QPushButton("📥 Import Calibrations")
+        import_cal_btn.clicked.connect(self.import_calibrations)
+        cal_mgmt_layout.addWidget(import_cal_btn)
+        
+        reset_cal_btn = QPushButton("🗑️ Reset All Calibrations")
+        reset_cal_btn.clicked.connect(self.reset_all_calibrations)
+        reset_cal_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+            }
+        """)
+        cal_mgmt_layout.addWidget(reset_cal_btn)
+        
+        cal_mgmt_layout.addStretch()
+        calibration_status_layout.addLayout(cal_mgmt_layout)
+        
+        multi_element_layout.addWidget(calibration_status_group)
+        
+        # Element selection group
+        element_selection_group = QGroupBox("Element Selection")
+        element_selection_layout = QHBoxLayout(element_selection_group)
+        
+        element_selection_layout.addWidget(QLabel("Current Element:"))
+        self.element_combo = QComboBox()
+        self.element_combo.addItems(list(ELEMENT_DEFINITIONS.keys()))
+        self.element_combo.setCurrentText('Pb')  # Default to Pb
+        self.element_combo.currentTextChanged.connect(self.on_element_changed)
+        element_selection_layout.addWidget(self.element_combo)
+        element_selection_layout.addStretch()
+        
+        multi_element_layout.addWidget(element_selection_group)
+        
+        # Element properties display
+        element_props_group = QGroupBox("Element Properties")
+        element_props_layout = QGridLayout(element_props_group)
+        
+        element_props_layout.addWidget(QLabel("Primary Energy (keV):"), 0, 0)
+        self.element_energy_label = QLabel("10.55")
+        element_props_layout.addWidget(self.element_energy_label, 0, 1)
+        
+        element_props_layout.addWidget(QLabel("Peak Region (keV):"), 1, 0)
+        self.element_peak_region_label = QLabel("10.0 - 11.0")
+        element_props_layout.addWidget(self.element_peak_region_label, 1, 1)
+        
+        element_props_layout.addWidget(QLabel("Integration Region (keV):"), 2, 0)
+        self.element_integration_region_label = QLabel("9.8 - 11.2")
+        element_props_layout.addWidget(self.element_integration_region_label, 2, 1)
+        
+        multi_element_layout.addWidget(element_props_group)
+        
+        # Element calibration parameters
+        element_cal_group = QGroupBox("Element Calibration Parameters")
+        element_cal_layout = QGridLayout(element_cal_group)
+        
+        element_cal_layout.addWidget(QLabel("Slope:"), 0, 0)
+        self.element_slope_edit = QLineEdit("13.8913")
+        element_cal_layout.addWidget(self.element_slope_edit, 0, 1)
+        
+        element_cal_layout.addWidget(QLabel("Intercept:"), 1, 0)
+        self.element_intercept_edit = QLineEdit("0.0")
+        element_cal_layout.addWidget(self.element_intercept_edit, 1, 1)
+        
+        # Update button for element calibration
+        self.update_element_cal_btn = QPushButton("Update Element Calibration")
+        self.update_element_cal_btn.clicked.connect(self.update_element_calibration)
+        element_cal_layout.addWidget(self.update_element_cal_btn, 2, 0, 1, 2)
+        
+        multi_element_layout.addWidget(element_cal_group)
+        
+        # Reference materials table
+        ref_materials_group = QGroupBox("Reference Materials Database")
+        ref_materials_layout = QVBoxLayout(ref_materials_group)
+        
+        # Create table for reference materials
+        self.ref_materials_table = QTableWidget()
+        self.setup_reference_materials_table()
+        ref_materials_layout.addWidget(self.ref_materials_table)
+        
+        # Buttons for reference materials
+        ref_buttons_layout = QVBoxLayout()
+        
+        # First row of buttons
+        ref_buttons_row1 = QHBoxLayout()
+        
+        self.create_calibration_btn = QPushButton("🧮 Create Calibration from Standards")
+        self.create_calibration_btn.clicked.connect(self.create_calibration_from_standards)
+        self.create_calibration_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 8px 12px;
+                border-radius: 4px;
+                min-height: 20px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        ref_buttons_row1.addWidget(self.create_calibration_btn)
+        
+        self.auto_calibration_btn = QPushButton("🤖 Auto-Calibrate Current Element")
+        self.auto_calibration_btn.clicked.connect(self.auto_calibrate_from_spectra)
+        self.auto_calibration_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                padding: 8px 12px;
+                border-radius: 4px;
+                min-height: 20px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        ref_buttons_row1.addWidget(self.auto_calibration_btn)
+        
+        # Second row of buttons
+        ref_buttons_row2 = QHBoxLayout()
+        
+        self.auto_calibrate_all_btn = QPushButton("🚀 Auto-Calibrate ALL Elements")
+        self.auto_calibrate_all_btn.clicked.connect(self.auto_calibrate_all_elements)
+        self.auto_calibrate_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E91E63;
+                color: white;
+                font-weight: bold;
+                padding: 8px 12px;
+                border-radius: 4px;
+                min-height: 20px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #C2185B;
+            }
+        """)
+        ref_buttons_row2.addWidget(self.auto_calibrate_all_btn)
+        
+        self.view_standards_btn = QPushButton("📊 View Standards Plot")
+        self.view_standards_btn.clicked.connect(self.view_standards_plot)
+        self.view_standards_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                font-weight: bold;
+                padding: 8px 12px;
+                border-radius: 4px;
+                min-height: 20px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #546E7A;
+            }
+        """)
+        ref_buttons_row2.addWidget(self.view_standards_btn)
+        
+        ref_buttons_row1.addStretch()
+        ref_buttons_row2.addStretch()
+        
+        ref_buttons_layout.addLayout(ref_buttons_row1)
+        ref_buttons_layout.addLayout(ref_buttons_row2)
+        
+        ref_materials_layout.addLayout(ref_buttons_layout)
+        
+        multi_element_layout.addWidget(ref_materials_group)
+        multi_element_layout.addStretch()
+        
+        self.advanced_subtabs.addTab(multi_element_tab, "Multi-Element Calibrations")
 
         # Remove protocol subtab - will be replaced with button
 
@@ -1630,19 +2390,27 @@ class XRFPeakFittingGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "No files selected for batch processing")
             return
         
+        # Get selected elements
+        selected_elements = self.get_selected_elements()
+        if not selected_elements:
+            QMessageBox.warning(self, "No Elements Selected", 
+                              "Please select at least one element to analyze.")
+            return
+        
         # Get fitting parameters
         fitting_params = {
             'peak_min': self.peak_min_spin.value(),
             'peak_max': self.peak_max_spin.value(),
             'integration_min': self.integration_min_spin.value(),
             'integration_max': self.integration_max_spin.value(),
-            'background_subtract': self.bg_subtract_check.isChecked()
+            'background_subtract': self.bg_subtract_check.isChecked(),
+            'selected_elements': selected_elements
         }
         
         spectra_per_sample = self.spectra_per_sample_spin.value()
         
         # Start processing thread
-        self.processing_thread = ProcessingThread(self.batch_file_paths, fitting_params, spectra_per_sample)
+        self.processing_thread = MultiElementProcessingThread(self.batch_file_paths, fitting_params, spectra_per_sample)
         self.processing_thread.progress.connect(self.progress_bar.setValue)
         self.processing_thread.error_occurred.connect(self.on_processing_error)
         self.processing_thread.finished.connect(self.on_batch_finished)
@@ -1685,25 +2453,34 @@ class XRFPeakFittingGUI(QMainWindow):
         # Initialize spectrum browser
         self.initialize_spectrum_browser()
         
-        # Display sample statistics
-        self.display_sample_statistics(sample_groups)
+        # Check if this is multi-element results
+        is_multi_element = (results and 'element_results' in results[0])
         
-        # Automatically show sample statistics plot
-        if sample_groups:
-            # Ensure subplots are set up first
-            self.plot_canvas.setup_subplots()
-            self.plot_canvas.plot_sample_statistics(sample_groups)
-        
-        # Display summary
-        successful = len([r for r in results if 'fit_params' in r])
-        total = len(self.batch_file_paths)
-        
-        self.results_text.append(f"\n=== BATCH PROCESSING COMPLETE ===")
-        self.results_text.append(f"Total files processed: {successful}/{total}")
-        self.results_text.append(f"Samples analyzed: {len(sample_groups)}")
-        
-        QMessageBox.information(self, "Batch Processing Complete", 
-                              f"Processing complete!\n{successful}/{total} files processed successfully\n{len(sample_groups)} samples analyzed\n\nUse the Spectrum Browser to examine individual fits.")
+        if is_multi_element:
+            # Display multi-element sample statistics
+            self.display_multi_element_sample_statistics(sample_groups)
+            
+            # Display multi-element summary
+            self.display_multi_element_summary(results, sample_groups)
+        else:
+            # Display single-element sample statistics
+            self.display_sample_statistics(sample_groups)
+            
+            # Automatically show sample statistics plot
+            if sample_groups:
+                self.plot_canvas.setup_subplots()
+                self.plot_canvas.plot_sample_statistics(sample_groups)
+            
+            # Display single-element summary
+            successful = len([r for r in results if 'fit_params' in r])
+            total = len(self.batch_file_paths)
+            
+            self.results_text.append(f"\n=== BATCH PROCESSING COMPLETE ===")
+            self.results_text.append(f"Total files processed: {successful}/{total}")
+            self.results_text.append(f"Samples analyzed: {len(sample_groups)}")
+            
+            QMessageBox.information(self, "Batch Processing Complete", 
+                                  f"Processing complete!\n{successful}/{total} files processed successfully\n{len(sample_groups)} samples analyzed\n\nUse the Spectrum Browser to examine individual fits.")
     
     def display_fit_results(self, fit_params, r_squared, integrated_intensity, concentration):
         """Display fitting results for single file"""
@@ -2437,6 +3214,1183 @@ Calibrated Concentration: {concentration:.4f}
         doc.add_paragraph(f"Sample: {sample_group.sample_name}")
         doc.add_paragraph(f"Mean Concentration: {sample_group.mean_concentration:.4f} ppm")
         doc.add_paragraph(f"RSD: {sample_group.rsd_concentration:.2f}%")
+
+    def setup_reference_materials_table(self):
+        """Setup the reference materials table with certified values"""
+        elements = list(ELEMENT_DEFINITIONS.keys())
+        materials = list(REFERENCE_MATERIALS.keys())
+        
+        self.ref_materials_table.setRowCount(len(elements))
+        self.ref_materials_table.setColumnCount(len(materials) + 1)
+        
+        # Set headers
+        headers = ['Element'] + materials
+        self.ref_materials_table.setHorizontalHeaderLabels(headers)
+        
+        # Populate table
+        for i, element in enumerate(elements):
+            # Element name
+            element_item = QTableWidgetItem(f"{element} ({ELEMENT_DEFINITIONS[element]['name']})")
+            element_item.setFlags(element_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.ref_materials_table.setItem(i, 0, element_item)
+            
+            # Certified values for each material
+            for j, material in enumerate(materials):
+                value = REFERENCE_MATERIALS[material].get(element)
+                if value is not None:
+                    if isinstance(value, str):
+                        display_value = value
+                    else:
+                        display_value = str(value)
+                else:
+                    display_value = "N/A"
+                
+                value_item = QTableWidgetItem(display_value)
+                value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                
+                # Color coding for availability
+                if value is not None and value != "N/A":
+                    value_item.setBackground(QColor(144, 238, 144))  # Light green
+                else:
+                    value_item.setBackground(QColor(211, 211, 211))  # Light gray
+                
+                self.ref_materials_table.setItem(i, j + 1, value_item)
+        
+        # Resize columns to content
+        self.ref_materials_table.resizeColumnsToContents()
+        
+        # Set alternating row colors
+        self.ref_materials_table.setAlternatingRowColors(True)
+    
+    def on_element_changed(self, element_symbol):
+        """Handle element selection change"""
+        if element_symbol in ELEMENT_DEFINITIONS:
+            element_data = ELEMENT_DEFINITIONS[element_symbol]
+            
+            # Update element properties display
+            self.element_energy_label.setText(f"{element_data['primary_energy']}")
+            self.element_peak_region_label.setText(f"{element_data['peak_region'][0]} - {element_data['peak_region'][1]}")
+            self.element_integration_region_label.setText(f"{element_data['integration_region'][0]} - {element_data['integration_region'][1]}")
+            
+            # Update calibration parameters
+            if hasattr(self.peak_fitter, 'element_calibrations') and element_symbol in self.peak_fitter.element_calibrations:
+                cal_data = self.peak_fitter.element_calibrations[element_symbol]
+                self.element_slope_edit.setText(str(cal_data['slope']))
+                self.element_intercept_edit.setText(str(cal_data['intercept']))
+            else:
+                # Use default calibration
+                default_cal = element_data['default_calibration']
+                self.element_slope_edit.setText(str(default_cal['slope']))
+                self.element_intercept_edit.setText(str(default_cal['intercept']))
+            
+            # Update peak fitter to current element
+            self.peak_fitter.set_element(element_symbol)
+            
+            # Update main fitter as well
+            self.fitter.set_element(element_symbol)
+            
+            # Update fitting parameters in the main UI
+            self.update_fitting_parameters_for_element(element_symbol)
+            
+            # Highlight current element in reference materials table
+            self.highlight_element_in_table(element_symbol)
+    
+    def highlight_element_in_table(self, element_symbol):
+        """Highlight the selected element row in the reference materials table"""
+        elements = list(ELEMENT_DEFINITIONS.keys())
+        if element_symbol in elements:
+            row_index = elements.index(element_symbol)
+            self.ref_materials_table.selectRow(row_index)
+    
+    def update_fitting_parameters_for_element(self, element_symbol):
+        """Update the fitting parameters in the main UI for the selected element"""
+        if element_symbol in ELEMENT_DEFINITIONS:
+            element_data = ELEMENT_DEFINITIONS[element_symbol]
+            
+            # Update peak region parameters
+            peak_region = element_data['peak_region']
+            self.peak_min_spin.setValue(peak_region[0])
+            self.peak_max_spin.setValue(peak_region[1])
+            
+            # Update integration region parameters
+            integration_region = element_data['integration_region']
+            self.integration_min_spin.setValue(integration_region[0])
+            self.integration_max_spin.setValue(integration_region[1])
+            
+            # Update calibration parameters in the main calibration section
+            if hasattr(self.fitter, 'element_calibrations') and element_symbol in self.fitter.element_calibrations:
+                cal_data = self.fitter.element_calibrations[element_symbol]
+                self.calibration_slope_edit.setText(str(cal_data['slope']))
+                self.calibration_intercept_edit.setText(str(cal_data['intercept']))
+            else:
+                default_cal = element_data['default_calibration']
+                self.calibration_slope_edit.setText(str(default_cal['slope']))
+                self.calibration_intercept_edit.setText(str(default_cal['intercept']))
+            
+            # Update window title to reflect current element
+            element_name = element_data['name']
+            energy = element_data['primary_energy']
+            self.setWindowTitle(f"XRF Peak Fitting - {element_name} ({element_symbol}) at {energy} keV")
+    
+    def update_element_calibration(self):
+        """Update calibration parameters for the current element"""
+        try:
+            current_element = self.element_combo.currentText()
+            slope = float(self.element_slope_edit.text())
+            intercept = float(self.element_intercept_edit.text())
+            
+            # Update the peak fitter
+            self.peak_fitter.update_element_calibration(current_element, slope, intercept)
+            self.fitter.update_element_calibration(current_element, slope, intercept)
+            
+            # Save calibration persistently
+            self.calibration_manager.update_calibration(
+                current_element, slope, intercept, None, ["Manual Entry"]
+            )
+            
+            # Refresh status display
+            self.refresh_calibration_status()
+            
+            # Show confirmation
+            QMessageBox.information(self, "Calibration Updated", 
+                                  f"Calibration for {current_element} has been updated and saved:\n"
+                                  f"Slope: {slope:.4f}\n"
+                                  f"Intercept: {intercept:.4f}")
+            
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", 
+                              "Please enter valid numeric values for slope and intercept.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update calibration: {str(e)}")
+    
+    def create_calibration_from_standards(self):
+        """Create calibration curve from reference material standards"""
+        current_element = self.element_combo.currentText()
+        
+        # Collect available standards for this element
+        available_standards = []
+        concentrations = []
+        
+        for material_name, material_data in REFERENCE_MATERIALS.items():
+            value = material_data.get(current_element)
+            if value is not None and value != "N/A":
+                # Parse concentration value
+                try:
+                    if isinstance(value, str):
+                        # Handle percentage values
+                        if '%' in value:
+                            if '<' in value:
+                                continue  # Skip below detection limit values
+                            conc = float(value.replace('%', '')) * 10000  # Convert % to ppm
+                        else:
+                            conc = float(value)
+                    else:
+                        conc = float(value)
+                    
+                    available_standards.append(material_name)
+                    concentrations.append(conc)
+                except (ValueError, TypeError):
+                    continue
+        
+        if len(available_standards) < 2:
+            QMessageBox.warning(self, "Insufficient Standards", 
+                              f"At least 2 reference materials with certified values are needed for {current_element}.\n"
+                              f"Only {len(available_standards)} standards available.")
+            return
+        
+        # Show dialog to create calibration
+        self.show_calibration_creation_dialog(current_element, available_standards, concentrations)
+    
+    def show_calibration_creation_dialog(self, element, standards, concentrations):
+        """Show dialog for creating calibration from standards"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Create {element} Calibration from Standards")
+        dialog.setGeometry(300, 300, 600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        info_label = QLabel(f"To create a calibration for {element}, you need to:\n"
+                           f"1. Measure XRF spectra of the reference materials\n"
+                           f"2. Enter the integrated intensities for each standard\n"
+                           f"3. The system will calculate the calibration curve")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Standards table
+        table = QTableWidget(len(standards), 3)
+        table.setHorizontalHeaderLabels(['Standard', 'Certified Conc. (ppm)', 'Measured Intensity'])
+        
+        intensity_edits = []
+        for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+            # Standard name
+            table.setItem(i, 0, QTableWidgetItem(standard))
+            table.item(i, 0).setFlags(table.item(i, 0).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            # Certified concentration
+            table.setItem(i, 1, QTableWidgetItem(f"{conc:.2f}"))
+            table.item(i, 1).setFlags(table.item(i, 1).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            # Intensity input
+            intensity_edit = QLineEdit()
+            intensity_edit.setPlaceholderText("Enter measured intensity...")
+            table.setCellWidget(i, 2, intensity_edit)
+            intensity_edits.append(intensity_edit)
+        
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        calculate_btn = QPushButton("Calculate Calibration")
+        cancel_btn = QPushButton("Cancel")
+        
+        def calculate_calibration():
+            try:
+                # Get intensities
+                intensities = []
+                for edit in intensity_edits:
+                    if edit.text().strip():
+                        intensities.append(float(edit.text()))
+                    else:
+                        QMessageBox.warning(dialog, "Missing Data", "Please enter all intensity values.")
+                        return
+                
+                if len(intensities) != len(concentrations):
+                    QMessageBox.warning(dialog, "Data Mismatch", "Number of intensities doesn't match standards.")
+                    return
+                
+                # Calculate linear regression
+                slope, intercept, r_value, p_value, std_err = stats.linregress(intensities, concentrations)
+                
+                # Show results
+                result_msg = (f"Calibration Results for {element}:\n\n"
+                             f"Equation: Concentration = {slope:.4f} × Intensity + {intercept:.4f}\n"
+                             f"R² = {r_value**2:.4f}\n"
+                             f"Standard Error = {std_err:.4f}\n\n"
+                             f"Apply this calibration?")
+                
+                reply = QMessageBox.question(dialog, "Calibration Results", result_msg,
+                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    # Update calibration
+                    self.peak_fitter.update_element_calibration(element, slope, intercept)
+                    self.element_slope_edit.setText(f"{slope:.4f}")
+                    self.element_intercept_edit.setText(f"{intercept:.4f}")
+                    
+                    QMessageBox.information(dialog, "Success", f"Calibration for {element} has been updated!")
+                    dialog.accept()
+                
+            except ValueError:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter valid numeric values for intensities.")
+            except Exception as e:
+                QMessageBox.critical(dialog, "Error", f"Failed to calculate calibration: {str(e)}")
+        
+        calculate_btn.clicked.connect(calculate_calibration)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        button_layout.addWidget(calculate_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        dialog.exec()
+    
+    def view_standards_plot(self):
+        """Show a plot of available standards for the current element"""
+        current_element = self.element_combo.currentText()
+        
+        # Collect data for plotting
+        materials = []
+        concentrations = []
+        
+        for material_name, material_data in REFERENCE_MATERIALS.items():
+            value = material_data.get(current_element)
+            if value is not None and value != "N/A":
+                try:
+                    if isinstance(value, str):
+                        if '%' in value:
+                            if '<' in value:
+                                continue
+                            conc = float(value.replace('%', '')) * 10000  # Convert % to ppm
+                        else:
+                            conc = float(value)
+                    else:
+                        conc = float(value)
+                    
+                    materials.append(material_name)
+                    concentrations.append(conc)
+                except (ValueError, TypeError):
+                    continue
+        
+        if not materials:
+            QMessageBox.information(self, "No Data", f"No certified values available for {current_element}.")
+            return
+        
+        # Create plot
+        try:
+            import matplotlib.pyplot as plt
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Bar plot of concentrations
+            bars = ax.bar(range(len(materials)), concentrations, color='steelblue', alpha=0.7)
+            
+            # Customize plot
+            ax.set_xlabel('Reference Material')
+            ax.set_ylabel(f'{current_element} Concentration (ppm)')
+            ax.set_title(f'Certified {current_element} Concentrations in Reference Materials')
+            ax.set_xticks(range(len(materials)))
+            ax.set_xticklabels(materials, rotation=45, ha='right')
+            
+            # Add value labels on bars
+            for bar, conc in zip(bars, concentrations):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + max(concentrations)*0.01,
+                       f'{conc:.1f}', ha='center', va='bottom')
+            
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+            
+        except ImportError:
+            QMessageBox.warning(self, "Plot Error", "Matplotlib is required for plotting.")
+        except Exception as e:
+            QMessageBox.critical(self, "Plot Error", f"Failed to create plot: {str(e)}")
+
+    def auto_calibrate_from_spectra(self):
+        """Automatically create calibration by analyzing XRF spectra files of reference materials"""
+        current_element = self.element_combo.currentText()
+        
+        # Collect available standards for this element
+        available_standards = []
+        concentrations = []
+        
+        for material_name, material_data in REFERENCE_MATERIALS.items():
+            value = material_data.get(current_element)
+            if value is not None and value != "N/A":
+                try:
+                    if isinstance(value, str):
+                        if '%' in value:
+                            if '<' in value:
+                                continue  # Skip below detection limit values
+                            conc = float(value.replace('%', '')) * 10000  # Convert % to ppm
+                        else:
+                            conc = float(value)
+                    else:
+                        conc = float(value)
+                    
+                    available_standards.append(material_name)
+                    concentrations.append(conc)
+                except (ValueError, TypeError):
+                    continue
+        
+        if len(available_standards) < 2:
+            QMessageBox.warning(self, "Insufficient Standards", 
+                              f"At least 2 reference materials with certified values are needed for {current_element}.\n"
+                              f"Only {len(available_standards)} standards available.")
+            return
+        
+        # Show dialog for file selection and automatic analysis
+        self.show_auto_calibration_dialog(current_element, available_standards, concentrations)
+    
+    def show_auto_calibration_dialog(self, element, standards, concentrations):
+        """Show dialog for automatic calibration from spectra files"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Auto-Calibrate {element} from Spectra Files")
+        dialog.setGeometry(300, 200, 800, 600)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        info_label = QLabel(f"Automatic {element} Calibration from XRF Spectra Files\n\n"
+                           f"This tool will:\n"
+                           f"1. Load XRF spectra files for each reference material\n"
+                           f"2. Automatically fit peaks and calculate integrated intensities\n"
+                           f"3. Create a calibration curve using the certified concentrations\n\n"
+                           f"Select spectra files for each available standard:")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
+        layout.addWidget(info_label)
+        
+        # File selection table
+        file_table = QTableWidget(len(standards), 4)
+        file_table.setHorizontalHeaderLabels(['Standard', 'Certified Conc. (ppm)', 'Spectra File', 'Status'])
+        
+        file_buttons = []
+        file_paths = {}
+        status_labels = []
+        
+        for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+            # Standard name
+            file_table.setItem(i, 0, QTableWidgetItem(standard))
+            file_table.item(i, 0).setFlags(file_table.item(i, 0).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            # Certified concentration
+            file_table.setItem(i, 1, QTableWidgetItem(f"{conc:.2f}"))
+            file_table.item(i, 1).setFlags(file_table.item(i, 1).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            # File selection button
+            file_btn = QPushButton(f"Select {standard} File...")
+            file_btn.clicked.connect(lambda checked, std=standard: self.select_standard_file(std, file_paths, status_labels, standards))
+            file_table.setCellWidget(i, 2, file_btn)
+            file_buttons.append(file_btn)
+            
+            # Status
+            status_item = QTableWidgetItem("No file selected")
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            file_table.setItem(i, 3, status_item)
+            status_labels.append(status_item)
+        
+        file_table.resizeColumnsToContents()
+        layout.addWidget(file_table)
+        
+        # Progress area
+        progress_group = QGroupBox("Analysis Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        self.calibration_progress = QTextEdit()
+        self.calibration_progress.setMaximumHeight(150)
+        self.calibration_progress.setReadOnly(True)
+        progress_layout.addWidget(self.calibration_progress)
+        
+        layout.addWidget(progress_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        analyze_btn = QPushButton("🔬 Analyze All Spectra & Create Calibration")
+        analyze_btn.clicked.connect(lambda: self.analyze_all_standards(element, standards, concentrations, file_paths, dialog))
+        analyze_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        button_layout.addWidget(analyze_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Store references for use in other methods
+        dialog.file_paths = file_paths
+        dialog.status_labels = status_labels
+        dialog.standards = standards
+        
+        dialog.exec()
+    
+    def select_standard_file(self, standard_name, file_paths, status_labels, standards):
+        """Select a spectra file for a specific standard"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"Select {standard_name} Spectra File", "", 
+            "All Files (*);;CSV Files (*.csv);;Text Files (*.txt);;Excel Files (*.xlsx)"
+        )
+        
+        if file_path:
+            file_paths[standard_name] = file_path
+            # Update status in table
+            standard_index = standards.index(standard_name)
+            status_labels[standard_index].setText(f"✓ {os.path.basename(file_path)}")
+            status_labels[standard_index].setBackground(QColor(144, 238, 144))  # Light green
+    
+    def analyze_all_standards(self, element, standards, concentrations, file_paths, dialog):
+        """Analyze all selected spectra files and create calibration"""
+        self.calibration_progress.clear()
+        self.calibration_progress.append(f"Starting automatic calibration for {element}...\n")
+        
+        # Check that all files are selected
+        missing_files = [std for std in standards if std not in file_paths]
+        if missing_files:
+            QMessageBox.warning(dialog, "Missing Files", 
+                              f"Please select spectra files for: {', '.join(missing_files)}")
+            return
+        
+        # Create a temporary peak fitter for this element
+        temp_fitter = XRFPeakFitter(element=element)
+        
+        measured_intensities = []
+        valid_concentrations = []
+        valid_standards = []
+        
+        for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+            if standard not in file_paths:
+                continue
+                
+            file_path = file_paths[standard]
+            self.calibration_progress.append(f"Analyzing {standard} ({os.path.basename(file_path)})...")
+            QApplication.processEvents()  # Update UI
+            
+            try:
+                # Load and analyze the file
+                data = self.read_xrf_file(file_path)
+                if data is None:
+                    self.calibration_progress.append(f"  ✗ Failed to load file")
+                    continue
+                
+                x, y = data
+                
+                # Fit the peak for this element
+                fit_params, fit_curve, r_squared, x_fit, integrated_intensity, concentration = temp_fitter.fit_peak(
+                    x, y, 
+                    peak_region=None,  # Use element defaults
+                    background_subtract=True,
+                    integration_region=None  # Use element defaults
+                )
+                
+                measured_intensities.append(integrated_intensity)
+                valid_concentrations.append(conc)
+                valid_standards.append(standard)
+                
+                self.calibration_progress.append(f"  ✓ Integrated Intensity: {integrated_intensity:.2f}")
+                self.calibration_progress.append(f"  ✓ R² = {r_squared:.4f}")
+                
+            except Exception as e:
+                self.calibration_progress.append(f"  ✗ Error: {str(e)}")
+                continue
+        
+        if len(measured_intensities) < 2:
+            QMessageBox.warning(dialog, "Insufficient Data", 
+                              "Need at least 2 successful analyses to create calibration.")
+            return
+        
+        # Calculate calibration curve
+        try:
+            slope, intercept, r_value, p_value, std_err = stats.linregress(measured_intensities, valid_concentrations)
+            
+            self.calibration_progress.append(f"\n🎯 Calibration Results:")
+            self.calibration_progress.append(f"Equation: Concentration = {slope:.4f} × Intensity + {intercept:.4f}")
+            self.calibration_progress.append(f"R² = {r_value**2:.4f}")
+            self.calibration_progress.append(f"Standard Error = {std_err:.4f}")
+            self.calibration_progress.append(f"Standards used: {', '.join(valid_standards)}")
+            
+            # Show results and ask for confirmation
+            result_msg = (f"Automatic Calibration Results for {element}:\n\n"
+                         f"Equation: Concentration = {slope:.4f} × Intensity + {intercept:.4f}\n"
+                         f"R² = {r_value**2:.4f}\n"
+                         f"Standard Error = {std_err:.4f}\n"
+                         f"Standards analyzed: {len(valid_standards)}/{len(standards)}\n\n"
+                         f"Apply this calibration?")
+            
+            reply = QMessageBox.question(dialog, "Calibration Results", result_msg,
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Update calibration in fitters
+                self.peak_fitter.update_element_calibration(element, slope, intercept)
+                self.fitter.update_element_calibration(element, slope, intercept)
+                
+                # Save calibration persistently
+                standards_used = [standards[i] for i in range(len(standards)) if i < len(measured_intensities)]
+                self.calibration_manager.update_calibration(
+                    element, slope, intercept, r_value**2, standards_used
+                )
+                
+                # Update UI
+                self.element_slope_edit.setText(f"{slope:.4f}")
+                self.element_intercept_edit.setText(f"{intercept:.4f}")
+                self.refresh_calibration_status()  # Update status display
+                
+                QMessageBox.information(dialog, "Success", 
+                                      f"Automatic calibration for {element} has been created and applied!\n\n"
+                                      f"The calibration is now active and will be used for all {element} analyses.\n"
+                                      f"Calibration saved permanently.")
+                dialog.accept()
+            
+        except Exception as e:
+            QMessageBox.critical(dialog, "Calibration Error", f"Failed to calculate calibration: {str(e)}")
+
+    def select_all_elements(self):
+        """Select all elements for analysis"""
+        for checkbox in self.element_checkboxes.values():
+            checkbox.setChecked(True)
+    
+    def select_none_elements(self):
+        """Deselect all elements"""
+        for checkbox in self.element_checkboxes.values():
+            checkbox.setChecked(False)
+    
+    def select_common_elements(self):
+        """Select commonly analyzed elements"""
+        common_elements = ['Pb', 'Zn', 'Cu', 'Cr']
+        for element, checkbox in self.element_checkboxes.items():
+            checkbox.setChecked(element in common_elements)
+    
+    def get_selected_elements(self):
+        """Get list of selected elements for analysis"""
+        selected = []
+        for element, checkbox in self.element_checkboxes.items():
+            if checkbox.isChecked():
+                selected.append(element)
+        return selected
+
+    def setup_calibration_status_table(self):
+        """Setup the calibration status table"""
+        elements = list(ELEMENT_DEFINITIONS.keys())
+        self.calibration_status_table.setRowCount(len(elements))
+        self.calibration_status_table.setColumnCount(6)
+        self.calibration_status_table.setHorizontalHeaderLabels([
+            'Element', 'Status', 'Equation', 'R²', 'Created', 'Standards Used'
+        ])
+        
+        for i, element in enumerate(elements):
+            # Element name
+            element_data = ELEMENT_DEFINITIONS[element]
+            element_item = QTableWidgetItem(f"{element} ({element_data['name']})")
+            element_item.setFlags(element_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.calibration_status_table.setItem(i, 0, element_item)
+        
+        self.refresh_calibration_status()
+        self.calibration_status_table.resizeColumnsToContents()
+    
+    def refresh_calibration_status(self):
+        """Refresh the calibration status display"""
+        elements = list(ELEMENT_DEFINITIONS.keys())
+        
+        for i, element in enumerate(elements):
+            calibration = self.calibration_manager.get_calibration(element)
+            
+            if calibration:
+                # Has custom calibration
+                status_item = QTableWidgetItem("✅ Calibrated")
+                status_item.setBackground(QColor(144, 238, 144))  # Light green
+                
+                equation_item = QTableWidgetItem(calibration.get('equation', 'N/A'))
+                r_squared_item = QTableWidgetItem(f"{calibration.get('r_squared', 'N/A'):.4f}" if calibration.get('r_squared') else 'N/A')
+                
+                created_date = calibration.get('created_date', 'Unknown')
+                if created_date != 'Unknown':
+                    try:
+                        date_obj = datetime.fromisoformat(created_date)
+                        created_item = QTableWidgetItem(date_obj.strftime("%Y-%m-%d %H:%M"))
+                    except:
+                        created_item = QTableWidgetItem(created_date)
+                else:
+                    created_item = QTableWidgetItem('Unknown')
+                
+                standards_used = calibration.get('standards_used', [])
+                standards_item = QTableWidgetItem(f"{len(standards_used)} standards" if standards_used else 'N/A')
+                
+            else:
+                # Using default calibration
+                status_item = QTableWidgetItem("⚠️ Default")
+                status_item.setBackground(QColor(255, 182, 193))  # Light red
+                
+                default_cal = ELEMENT_DEFINITIONS[element]['default_calibration']
+                equation_item = QTableWidgetItem(f"Concentration = {default_cal['slope']:.4f} × Intensity + {default_cal['intercept']:.4f}")
+                r_squared_item = QTableWidgetItem('N/A')
+                created_item = QTableWidgetItem('Default')
+                standards_item = QTableWidgetItem('None')
+            
+            # Set all items as non-editable
+            for item in [status_item, equation_item, r_squared_item, created_item, standards_item]:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            self.calibration_status_table.setItem(i, 1, status_item)
+            self.calibration_status_table.setItem(i, 2, equation_item)
+            self.calibration_status_table.setItem(i, 3, r_squared_item)
+            self.calibration_status_table.setItem(i, 4, created_item)
+            self.calibration_status_table.setItem(i, 5, standards_item)
+        
+        self.calibration_status_table.resizeColumnsToContents()
+    
+    def export_calibrations(self):
+        """Export calibrations to a file"""
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export Calibrations", "xrf_calibrations_export.json", 
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if filename:
+            if self.calibration_manager.export_calibrations(filename):
+                QMessageBox.information(self, "Export Successful", 
+                                      f"Calibrations exported to:\n{filename}")
+            else:
+                QMessageBox.warning(self, "Export Failed", 
+                                  "Failed to export calibrations.")
+    
+    def import_calibrations(self):
+        """Import calibrations from a file"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Import Calibrations", "", 
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if filename:
+            reply = QMessageBox.question(self, "Import Calibrations", 
+                                       "This will overwrite existing calibrations with the same element names.\n\n"
+                                       "Do you want to continue?",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                if self.calibration_manager.import_calibrations(filename):
+                    self.load_saved_calibrations()  # Reload into fitters
+                    self.refresh_calibration_status()  # Refresh display
+                    QMessageBox.information(self, "Import Successful", 
+                                          f"Calibrations imported from:\n{filename}")
+                else:
+                    QMessageBox.warning(self, "Import Failed", 
+                                      "Failed to import calibrations.")
+    
+    def reset_all_calibrations(self):
+        """Reset all calibrations to defaults"""
+        reply = QMessageBox.question(self, "Reset All Calibrations", 
+                                   "This will delete ALL custom calibrations and revert to default values.\n\n"
+                                   "This action cannot be undone. Are you sure?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear all calibrations
+            self.calibration_manager.calibrations = {}
+            self.calibration_manager.save_calibrations()
+            
+            # Reset fitters to defaults
+            for element in ELEMENT_DEFINITIONS.keys():
+                default_cal = ELEMENT_DEFINITIONS[element]['default_calibration']
+                self.fitter.update_element_calibration(element, default_cal['slope'], default_cal['intercept'])
+                self.peak_fitter.update_element_calibration(element, default_cal['slope'], default_cal['intercept'])
+            
+            self.refresh_calibration_status()
+            QMessageBox.information(self, "Reset Complete", 
+                                  "All calibrations have been reset to default values.")
+
+    def display_multi_element_sample_statistics(self, sample_groups):
+        """Display statistics for multi-element sample groups"""
+        if not sample_groups:
+            return
+        
+        self.results_text.append(f"\n=== MULTI-ELEMENT SAMPLE STATISTICS ===")
+        
+        for group in sample_groups:
+            sample_name = group['sample_name']
+            element_groups = group['element_groups']
+            selected_elements = group['selected_elements']
+            
+            self.results_text.append(f"\n{sample_name}:")
+            self.results_text.append("-" * 40)
+            
+            for element in selected_elements:
+                if element in element_groups:
+                    element_group = element_groups[element]
+                    self.results_text.append(f"  {element} ({ELEMENT_DEFINITIONS[element]['name']}):")
+                    self.results_text.append(f"    Mean Concentration: {element_group.mean_concentration:.2f} ppm")
+                    self.results_text.append(f"    Std Dev: {element_group.std_concentration:.2f} ppm")
+                    self.results_text.append(f"    RSD: {element_group.rsd_concentration:.1f}%")
+                    self.results_text.append(f"    Spectra: {element_group.n_spectra}")
+                else:
+                    self.results_text.append(f"  {element}: No successful analyses")
+    
+    def display_multi_element_summary(self, results, sample_groups):
+        """Display summary for multi-element processing"""
+        if not results:
+            return
+        
+        selected_elements = results[0].get('selected_elements', [])
+        total_files = len(results)
+        
+        self.results_text.append(f"\n=== MULTI-ELEMENT PROCESSING COMPLETE ===")
+        self.results_text.append(f"Elements analyzed: {', '.join(selected_elements)}")
+        self.results_text.append(f"Total files processed: {total_files}")
+        self.results_text.append(f"Samples analyzed: {len(sample_groups)}")
+        
+        # Count successful analyses per element
+        element_success_counts = {}
+        for element in selected_elements:
+            success_count = 0
+            for result in results:
+                element_result = result.get('element_results', {}).get(element, {})
+                if 'error' not in element_result and element_result.get('concentration', 0) > 0:
+                    success_count += 1
+            element_success_counts[element] = success_count
+        
+        self.results_text.append(f"\nSuccess rates by element:")
+        for element in selected_elements:
+            success_rate = (element_success_counts[element] / total_files) * 100
+            self.results_text.append(f"  {element}: {element_success_counts[element]}/{total_files} ({success_rate:.1f}%)")
+        
+        # Show concentration ranges
+        self.results_text.append(f"\nConcentration ranges:")
+        for element in selected_elements:
+            concentrations = []
+            for result in results:
+                element_result = result.get('element_results', {}).get(element, {})
+                if 'error' not in element_result:
+                    conc = element_result.get('concentration', 0)
+                    if conc > 0:
+                        concentrations.append(conc)
+            
+            if concentrations:
+                min_conc = min(concentrations)
+                max_conc = max(concentrations)
+                self.results_text.append(f"  {element}: {min_conc:.2f} - {max_conc:.2f} ppm")
+            else:
+                self.results_text.append(f"  {element}: No valid results")
+        
+        QMessageBox.information(self, "Multi-Element Processing Complete", 
+                              f"Multi-element processing complete!\n\n"
+                              f"Elements: {', '.join(selected_elements)}\n"
+                              f"Files: {total_files}\n"
+                              f"Samples: {len(sample_groups)}\n\n"
+                              f"View results in the text panel and use the Spectrum Browser to examine individual fits.")
+
+    def auto_calibrate_all_elements(self):
+        """Automatically create calibrations for all elements with sufficient standards"""
+        # Find elements with sufficient standards (at least 2)
+        calibratable_elements = []
+        
+        for element in ELEMENT_DEFINITIONS.keys():
+            available_standards = []
+            concentrations = []
+            
+            for material_name, material_data in REFERENCE_MATERIALS.items():
+                value = material_data.get(element)
+                if value is not None and value != "N/A":
+                    try:
+                        if isinstance(value, str):
+                            if '%' in value:
+                                if '<' in value:
+                                    continue  # Skip below detection limit values
+                                conc = float(value.replace('%', '')) * 10000  # Convert % to ppm
+                            else:
+                                conc = float(value)
+                        else:
+                            conc = float(value)
+                        
+                        available_standards.append(material_name)
+                        concentrations.append(conc)
+                    except (ValueError, TypeError):
+                        continue
+            
+            if len(available_standards) >= 2:
+                calibratable_elements.append((element, available_standards, concentrations))
+        
+        if not calibratable_elements:
+            QMessageBox.warning(self, "No Elements Available", 
+                              "No elements have sufficient reference materials (≥2) for calibration.")
+            return
+        
+        # Show dialog for multi-element calibration
+        self.show_multi_element_calibration_dialog(calibratable_elements)
+    
+    def show_multi_element_calibration_dialog(self, calibratable_elements):
+        """Show dialog for calibrating multiple elements at once"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Auto-Calibrate All Elements")
+        dialog.setGeometry(200, 100, 1000, 700)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        info_label = QLabel(f"Multi-Element Automatic Calibration\n\n"
+                           f"This tool will calibrate {len(calibratable_elements)} elements simultaneously:\n"
+                           f"{', '.join([elem[0] for elem in calibratable_elements])}\n\n"
+                           f"For each reference material, select the XRF spectra file.\n"
+                           f"The system will analyze all elements in each file automatically.")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("QLabel { background-color: #E8F5E8; padding: 15px; border-radius: 8px; font-size: 12px; }")
+        layout.addWidget(info_label)
+        
+        # Get all unique reference materials needed
+        all_materials = set()
+        for element, standards, concentrations in calibratable_elements:
+            all_materials.update(standards)
+        
+        all_materials = sorted(list(all_materials))
+        
+        # File selection table
+        file_table = QTableWidget(len(all_materials), 3)
+        file_table.setHorizontalHeaderLabels(['Reference Material', 'Spectra File', 'Status'])
+        
+        file_paths = {}
+        status_labels = []
+        
+        for i, material in enumerate(all_materials):
+            # Material name
+            file_table.setItem(i, 0, QTableWidgetItem(material))
+            file_table.item(i, 0).setFlags(file_table.item(i, 0).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            
+            # File selection button
+            file_btn = QPushButton(f"Select {material} File...")
+            file_btn.clicked.connect(lambda checked, mat=material: self.select_material_file_for_multi(mat, file_paths, status_labels, all_materials))
+            file_table.setCellWidget(i, 1, file_btn)
+            
+            # Status
+            status_item = QTableWidgetItem("No file selected")
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            file_table.setItem(i, 2, status_item)
+            status_labels.append(status_item)
+        
+        file_table.resizeColumnsToContents()
+        layout.addWidget(file_table)
+        
+        # Element summary table
+        summary_group = QGroupBox("Elements to Calibrate")
+        summary_layout = QVBoxLayout(summary_group)
+        
+        element_table = QTableWidget(len(calibratable_elements), 3)
+        element_table.setHorizontalHeaderLabels(['Element', 'Standards Available', 'Concentration Range'])
+        
+        for i, (element, standards, concentrations) in enumerate(calibratable_elements):
+            # Element
+            element_item = QTableWidgetItem(f"{element} ({ELEMENT_DEFINITIONS[element]['name']})")
+            element_item.setFlags(element_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            element_table.setItem(i, 0, element_item)
+            
+            # Standards count
+            standards_item = QTableWidgetItem(f"{len(standards)} standards")
+            standards_item.setFlags(standards_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            element_table.setItem(i, 1, standards_item)
+            
+            # Concentration range
+            min_conc = min(concentrations)
+            max_conc = max(concentrations)
+            range_item = QTableWidgetItem(f"{min_conc:.1f} - {max_conc:.1f} ppm")
+            range_item.setFlags(range_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            element_table.setItem(i, 2, range_item)
+        
+        element_table.resizeColumnsToContents()
+        summary_layout.addWidget(element_table)
+        layout.addWidget(summary_group)
+        
+        # Progress area
+        progress_group = QGroupBox("Calibration Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        self.multi_calibration_progress = QTextEdit()
+        self.multi_calibration_progress.setMaximumHeight(200)
+        self.multi_calibration_progress.setReadOnly(True)
+        progress_layout.addWidget(self.multi_calibration_progress)
+        
+        layout.addWidget(progress_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        analyze_all_btn = QPushButton("🚀 Analyze All Files & Create All Calibrations")
+        analyze_all_btn.clicked.connect(lambda: self.analyze_all_elements_simultaneously(calibratable_elements, all_materials, file_paths, dialog))
+        analyze_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        button_layout.addWidget(analyze_all_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Store references
+        dialog.file_paths = file_paths
+        dialog.status_labels = status_labels
+        dialog.all_materials = all_materials
+        
+        dialog.exec()
+    
+    def select_material_file_for_multi(self, material_name, file_paths, status_labels, all_materials):
+        """Select a spectra file for a specific material in multi-element calibration"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"Select {material_name} Spectra File", "", 
+            "All Files (*);;CSV Files (*.csv);;Text Files (*.txt);;Excel Files (*.xlsx)"
+        )
+        
+        if file_path:
+            file_paths[material_name] = file_path
+            # Update status in table
+            material_index = all_materials.index(material_name)
+            status_labels[material_index].setText(f"✓ {os.path.basename(file_path)}")
+            status_labels[material_index].setBackground(QColor(144, 238, 144))  # Light green
+    
+    def analyze_all_elements_simultaneously(self, calibratable_elements, all_materials, file_paths, dialog):
+        """Analyze all elements in all files simultaneously and create calibrations"""
+        self.multi_calibration_progress.clear()
+        self.multi_calibration_progress.append("🚀 Starting Multi-Element Calibration...\n")
+        
+        # Check that all files are selected
+        missing_files = [mat for mat in all_materials if mat not in file_paths]
+        if missing_files:
+            QMessageBox.warning(dialog, "Missing Files", 
+                              f"Please select spectra files for: {', '.join(missing_files)}")
+            return
+        
+        # Dictionary to store results for each element
+        element_results = {}
+        
+        # Initialize results structure
+        for element, standards, concentrations in calibratable_elements:
+            element_results[element] = {
+                'intensities': [],
+                'concentrations': [],
+                'standards': [],
+                'fit_quality': []
+            }
+        
+        # Analyze each file for all elements
+        self.multi_calibration_progress.append(f"📁 Analyzing {len(all_materials)} reference material files...\n")
+        
+        for material in all_materials:
+            if material not in file_paths:
+                continue
+                
+            file_path = file_paths[material]
+            self.multi_calibration_progress.append(f"🔬 Analyzing {material} ({os.path.basename(file_path)})...")
+            QApplication.processEvents()  # Update UI
+            
+            try:
+                # Load the file once
+                data = self.read_xrf_file(file_path)
+                if data is None:
+                    self.multi_calibration_progress.append(f"  ✗ Failed to load file")
+                    continue
+                
+                x, y = data
+                
+                # Analyze each element in this file
+                for element, standards, concentrations in calibratable_elements:
+                    if material not in standards:
+                        continue  # This material doesn't have this element
+                    
+                    # Get the certified concentration for this element in this material
+                    material_data = REFERENCE_MATERIALS[material]
+                    cert_value = material_data.get(element)
+                    
+                    if cert_value is None or cert_value == "N/A":
+                        continue
+                    
+                    # Parse concentration
+                    try:
+                        if isinstance(cert_value, str):
+                            if '%' in cert_value:
+                                if '<' in cert_value:
+                                    continue
+                                cert_conc = float(cert_value.replace('%', '')) * 10000
+                            else:
+                                cert_conc = float(cert_value)
+                        else:
+                            cert_conc = float(cert_value)
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # Create element-specific fitter
+                    element_fitter = XRFPeakFitter(element=element)
+                    
+                    try:
+                        # Fit the peak for this element
+                        fit_params, fit_curve, r_squared, x_fit, integrated_intensity, concentration = element_fitter.fit_peak(
+                            x, y, 
+                            peak_region=None,  # Use element defaults
+                            background_subtract=True,
+                            integration_region=None  # Use element defaults
+                        )
+                        
+                        # Store results
+                        element_results[element]['intensities'].append(integrated_intensity)
+                        element_results[element]['concentrations'].append(cert_conc)
+                        element_results[element]['standards'].append(material)
+                        element_results[element]['fit_quality'].append(r_squared)
+                        
+                        self.multi_calibration_progress.append(f"    {element}: Intensity={integrated_intensity:.1f}, R²={r_squared:.3f}")
+                        
+                    except Exception as e:
+                        self.multi_calibration_progress.append(f"    {element}: ✗ Error - {str(e)}")
+                        continue
+                
+                self.multi_calibration_progress.append("")  # Blank line
+                
+            except Exception as e:
+                self.multi_calibration_progress.append(f"  ✗ File error: {str(e)}")
+                continue
+        
+        # Create calibrations for each element
+        self.multi_calibration_progress.append("📊 Creating calibration curves...\n")
+        
+        successful_calibrations = []
+        failed_calibrations = []
+        
+        for element, standards, concentrations in calibratable_elements:
+            results = element_results[element]
+            
+            if len(results['intensities']) < 2:
+                self.multi_calibration_progress.append(f"❌ {element}: Insufficient data ({len(results['intensities'])} points)")
+                failed_calibrations.append(element)
+                continue
+            
+            try:
+                # Calculate calibration
+                slope, intercept, r_value, p_value, std_err = stats.linregress(results['intensities'], results['concentrations'])
+                
+                # Update the calibrations in fitters
+                self.peak_fitter.update_element_calibration(element, slope, intercept)
+                self.fitter.update_element_calibration(element, slope, intercept)
+                
+                # Save calibration persistently
+                self.calibration_manager.update_calibration(
+                    element, slope, intercept, r_value**2, results['standards']
+                )
+                
+                successful_calibrations.append(element)
+                
+                self.multi_calibration_progress.append(f"✅ {element}: y = {slope:.4f}x + {intercept:.4f}, R² = {r_value**2:.4f}")
+                self.multi_calibration_progress.append(f"    Standards used: {', '.join(results['standards'])}")
+                
+            except Exception as e:
+                self.multi_calibration_progress.append(f"❌ {element}: Calibration failed - {str(e)}")
+                failed_calibrations.append(element)
+        
+        # Summary
+        self.multi_calibration_progress.append(f"\n🎯 Multi-Element Calibration Complete!")
+        self.multi_calibration_progress.append(f"✅ Successful: {len(successful_calibrations)} elements")
+        self.multi_calibration_progress.append(f"❌ Failed: {len(failed_calibrations)} elements")
+        
+        if successful_calibrations:
+            self.multi_calibration_progress.append(f"\nSuccessful calibrations: {', '.join(successful_calibrations)}")
+        
+        if failed_calibrations:
+            self.multi_calibration_progress.append(f"Failed calibrations: {', '.join(failed_calibrations)}")
+        
+        # Show summary dialog
+        if successful_calibrations:
+            summary_msg = (f"Multi-Element Calibration Results:\n\n"
+                          f"✅ Successfully calibrated: {len(successful_calibrations)} elements\n"
+                          f"   {', '.join(successful_calibrations)}\n\n"
+                          f"❌ Failed to calibrate: {len(failed_calibrations)} elements\n"
+                          f"   {', '.join(failed_calibrations) if failed_calibrations else 'None'}\n\n"
+                          f"Apply all successful calibrations?")
+            
+            reply = QMessageBox.question(dialog, "Multi-Element Calibration Results", summary_msg,
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Refresh calibration status display
+                self.refresh_calibration_status()
+                
+                QMessageBox.information(dialog, "Success", 
+                                      f"Multi-element calibration complete!\n\n"
+                                      f"{len(successful_calibrations)} element calibrations have been applied and saved.\n"
+                                      f"You can now analyze samples for all calibrated elements.")
+                dialog.accept()
+        else:
+            QMessageBox.warning(dialog, "Calibration Failed", 
+                              "No elements could be successfully calibrated.\n"
+                              "Please check your spectra files and try again.")
 
 
 class CustomCalibrationDialog(QDialog):
@@ -3577,6 +5531,25 @@ def parse_csv_format(file_path, format_type):
         if not data_lines:
             # If no data section found, try to parse the whole file
             try:
+                # First try with header
+                df = pd.read_csv(file_path)
+                
+                # Check for common column names
+                if 'Energy_keV' in df.columns and 'Intensity' in df.columns:
+                    x = df['Energy_keV'].values
+                    y = df['Intensity'].values
+                    return x, y, format_type
+                elif 'Energy' in df.columns and 'Intensity' in df.columns:
+                    x = df['Energy'].values
+                    y = df['Intensity'].values
+                    return x, y, format_type
+                elif len(df.columns) >= 2:
+                    # Use first two columns
+                    x = df.iloc[:, 0].values
+                    y = df.iloc[:, 1].values
+                    return x, y, format_type
+                
+                # If that fails, try without header
                 df = pd.read_csv(file_path, header=None)
                 
                 # Find the first two numeric columns
@@ -3870,6 +5843,14 @@ def plot_multiple_spectra(data_dict, elements_to_highlight=None):
 
 def main():
     app = QApplication(sys.argv)
+    
+    # macOS-specific fixes
+    if sys.platform == 'darwin':
+        # Set application attributes for macOS compatibility
+        app.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, True)
+        app.setAttribute(Qt.ApplicationAttribute.AA_NativeWindows, True)
+        # Fix for macOS dark mode and scaling issues
+        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
     
     # Set application style
     app.setStyle('Fusion')
