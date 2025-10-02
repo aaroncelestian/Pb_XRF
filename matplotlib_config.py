@@ -58,7 +58,8 @@ class CompactNavigationToolbar(NavigationToolbar2QT):
     """
     
     def __init__(self, canvas, parent, coordinates=True):
-        super().__init__(canvas, parent, coordinates)
+        # Call parent __init__ without coordinates parameter to avoid Qt version conflicts
+        super().__init__(canvas, parent)
         self._setup_compact_style()
     
     def _setup_compact_style(self):
