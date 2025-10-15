@@ -39,6 +39,13 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 import tempfile
 import shutil
 
+# Import FP method module
+try:
+    from xrf_fp_method import XRFFundamentalParameters, HAS_XRAYLIB
+except ImportError:
+    HAS_XRAYLIB = False
+    XRFFundamentalParameters = None
+
 # Helper function for zero-intercept linear regression
 def zero_intercept_regression(x, y):
     """
@@ -378,6 +385,24 @@ REFERENCE_MATERIALS = {
         'Se': None
     }
 }
+
+# Load XRF lines database for element identification
+def load_xrf_lines_database():
+    """Load XRF characteristic lines from CSV file"""
+    csv_path = os.path.join(os.path.dirname(__file__), 'data', 'xrf_lines_Na_to_U.csv')
+    try:
+        df = pd.read_csv(csv_path)
+        # Group by element for easy lookup
+        xrf_lines_db = {}
+        for element in df['Element'].unique():
+            element_lines = df[df['Element'] == element]
+            xrf_lines_db[element] = element_lines.to_dict('records')
+        return xrf_lines_db, df
+    except Exception as e:
+        print(f"Warning: Could not load XRF lines database: {e}")
+        return {}, pd.DataFrame()
+
+XRF_LINES_DB, XRF_LINES_DF = load_xrf_lines_database()
 
 # Import matplotlib configuration
 try:
@@ -926,6 +951,172 @@ class XRFPeakFitter:
             
         except Exception as e:
             raise RuntimeError(f"Fitting failed: {str(e)}")
+    
+    def fit_pb_as_deconvolution(self, x, y):
+        """
+        Simultaneous deconvolution of Pb and As peaks using multiple characteristic lines.
+        
+        This method addresses the overlap between Pb Lα1 (10.5515 keV) and As Kα1 (10.5437 keV)
+        by fitting all available lines:
+        - Pb: Lα1 (10.5515), Lα2 (10.4495), Lβ1 (12.6137)
+        - As: Kα1 (10.5437), Kα2 (10.5078), Kβ1 (11.7262)
+        
+        Uses theoretical intensity ratios as constraints to improve deconvolution accuracy.
+        
+        Returns:
+        - pb_results: dict with Pb fit parameters and concentration
+        - as_results: dict with As fit parameters and concentration
+        - combined_fit: fitted spectrum
+        - r_squared: goodness of fit
+        """
+        
+        # Define characteristic line energies and relative intensities from database
+        pb_lines = {
+            'La1': {'energy': 10.5515, 'rel_intensity': 100},
+            'La2': {'energy': 10.4495, 'rel_intensity': 10},
+            'Lb1': {'energy': 12.6137, 'rel_intensity': 75}
+        }
+        
+        as_lines = {
+            'Ka1': {'energy': 10.5437, 'rel_intensity': 100},
+            'Ka2': {'energy': 10.5078, 'rel_intensity': 50},
+            'Kb1': {'energy': 11.7262, 'rel_intensity': 62}
+        }
+        
+        # Define fitting region covering all peaks (10-13 keV)
+        fit_region = (9.8, 13.2)
+        mask = (x >= fit_region[0]) & (x <= fit_region[1])
+        x_fit = x[mask]
+        y_fit = y[mask]
+        
+        if len(x_fit) < 20:
+            raise ValueError("Insufficient data points for Pb-As deconvolution")
+        
+        # Estimate background
+        bg_mask = ((x_fit < 10.0) | (x_fit > 13.0))
+        if np.sum(bg_mask) > 2:
+            m_bg, b_bg = np.polyfit(x_fit[bg_mask], y_fit[bg_mask], 1)
+        else:
+            m_bg = 0
+            b_bg = np.min(y_fit)
+        
+        # Define multi-peak model
+        def multi_peak_model(x, pb_amp, as_amp, fwhm_pb, fwhm_as, m, b):
+            """
+            Model with all Pb and As characteristic lines.
+            Amplitudes are constrained by theoretical intensity ratios.
+            """
+            model = np.zeros_like(x)
+            
+            # Pb peaks (using Lα1 amplitude as reference)
+            for line_name, line_data in pb_lines.items():
+                amplitude = pb_amp * (line_data['rel_intensity'] / 100.0)
+                model += self.gaussian_a(x, amplitude, line_data['energy'], fwhm_pb)
+            
+            # As peaks (using Kα1 amplitude as reference)
+            for line_name, line_data in as_lines.items():
+                amplitude = as_amp * (line_data['rel_intensity'] / 100.0)
+                model += self.gaussian_a(x, amplitude, line_data['energy'], fwhm_as)
+            
+            # Add background
+            model += m * x + b
+            
+            return model
+        
+        # Initial parameter estimates
+        # Find peak around 10.5 keV (overlapped Pb Lα + As Kα)
+        overlap_mask = (x_fit >= 10.3) & (x_fit <= 10.7)
+        overlap_height = np.max(y_fit[overlap_mask]) if np.sum(overlap_mask) > 0 else 1000
+        
+        # Find As Kβ peak around 11.7 keV (well separated)
+        as_kb_mask = (x_fit >= 11.5) & (x_fit <= 11.9)
+        as_kb_height = np.max(y_fit[as_kb_mask]) if np.sum(as_kb_mask) > 0 else 100
+        
+        # Find Pb Lβ peak around 12.6 keV (well separated)
+        pb_lb_mask = (x_fit >= 12.4) & (x_fit <= 12.8)
+        pb_lb_height = np.max(y_fit[pb_lb_mask]) if np.sum(pb_lb_mask) > 0 else 100
+        
+        # Estimate initial amplitudes based on separated peaks
+        # As Kβ1 has 62% intensity relative to Kα1
+        as_amp_init = as_kb_height / 0.62 if as_kb_height > 0 else overlap_height * 0.5
+        
+        # Pb Lβ1 has 75% intensity relative to Lα1
+        pb_amp_init = pb_lb_height / 0.75 if pb_lb_height > 0 else overlap_height * 0.5
+        
+        # Initial guess: [pb_amp, as_amp, fwhm_pb, fwhm_as, m, b]
+        p0 = [pb_amp_init, as_amp_init, 0.15, 0.15, m_bg, b_bg]
+        
+        # Bounds: amplitudes > 0, FWHM between 0.05-0.5 keV
+        bounds = (
+            [0, 0, 0.05, 0.05, -np.inf, 0],
+            [np.inf, np.inf, 0.5, 0.5, np.inf, np.inf]
+        )
+        
+        try:
+            # Perform fit
+            popt, pcov = curve_fit(multi_peak_model, x_fit, y_fit, p0=p0, bounds=bounds, maxfev=10000)
+            
+            pb_amp, as_amp, fwhm_pb, fwhm_as, m, b = popt
+            
+            # Calculate fitted curve
+            combined_fit = multi_peak_model(x_fit, *popt)
+            
+            # Calculate R-squared
+            ss_res = np.sum((y_fit - combined_fit) ** 2)
+            ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            
+            # Calculate integrated intensities for each element
+            # Pb: integrate all Pb peaks
+            pb_intensity = 0
+            for line_name, line_data in pb_lines.items():
+                amplitude = pb_amp * (line_data['rel_intensity'] / 100.0)
+                # Gaussian-A area = amplitude * fwhm * sqrt(pi/ln(2))
+                pb_intensity += amplitude * fwhm_pb * np.sqrt(np.pi / np.log(2))
+            
+            # As: integrate all As peaks
+            as_intensity = 0
+            for line_name, line_data in as_lines.items():
+                amplitude = as_amp * (line_data['rel_intensity'] / 100.0)
+                as_intensity += amplitude * fwhm_as * np.sqrt(np.pi / np.log(2))
+            
+            # Apply calibrations
+            pb_concentration = None
+            as_concentration = None
+            
+            if 'Pb' in self.element_calibrations:
+                pb_cal = self.element_calibrations['Pb']
+                pb_concentration = pb_cal['slope'] * pb_intensity + pb_cal['intercept']
+            
+            if 'As' in self.element_calibrations:
+                as_cal = self.element_calibrations['As']
+                as_concentration = as_cal['slope'] * as_intensity + as_cal['intercept']
+            
+            # Prepare results
+            pb_results = {
+                'amplitude': pb_amp,
+                'fwhm': fwhm_pb,
+                'integrated_intensity': pb_intensity,
+                'concentration': pb_concentration,
+                'lines_used': ['Lα1', 'Lα2', 'Lβ1'],
+                'amplitude_error': np.sqrt(pcov[0, 0]) if pcov[0, 0] > 0 else 0,
+                'fwhm_error': np.sqrt(pcov[2, 2]) if pcov[2, 2] > 0 else 0
+            }
+            
+            as_results = {
+                'amplitude': as_amp,
+                'fwhm': fwhm_as,
+                'integrated_intensity': as_intensity,
+                'concentration': as_concentration,
+                'lines_used': ['Kα1', 'Kα2', 'Kβ1'],
+                'amplitude_error': np.sqrt(pcov[1, 1]) if pcov[1, 1] > 0 else 0,
+                'fwhm_error': np.sqrt(pcov[3, 3]) if pcov[3, 3] > 0 else 0
+            }
+            
+            return pb_results, as_results, x_fit, combined_fit, r_squared
+            
+        except Exception as e:
+            raise RuntimeError(f"Pb-As deconvolution failed: {str(e)}")
 
 class SampleGroup:
     """Class to handle groups of spectra from the same sample"""
@@ -1678,6 +1869,15 @@ class XRFPeakFittingGUI(QMainWindow):
         self.fit_single_btn.setEnabled(False)
         process_layout.addWidget(self.fit_single_btn)
         
+        # Note: Pb-As deconvolution is now automatic when both elements are selected
+        # Keeping the button hidden but code available for manual use if needed
+        # self.pb_as_deconv_btn = QPushButton("⚛️ Pb-As Deconvolution")
+        # self.pb_as_deconv_btn.clicked.connect(self.run_pb_as_deconvolution)
+        # self.pb_as_deconv_btn.setEnabled(False)
+        # self.pb_as_deconv_btn.setToolTip("Simultaneous fitting of overlapping Pb Lα and As Kα peaks using all characteristic lines")
+        # self.pb_as_deconv_btn.setStyleSheet("QPushButton { background-color: #FFE4B5; font-weight: bold; }")
+        # process_layout.addWidget(self.pb_as_deconv_btn)
+        
         self.fit_batch_btn = QPushButton("Process Batch")
         self.fit_batch_btn.clicked.connect(self.process_batch)
         self.fit_batch_btn.setEnabled(False)
@@ -2111,14 +2311,24 @@ class XRFPeakFittingGUI(QMainWindow):
         # Add stretch to push everything to top
         docs_export_layout.addStretch()
         
+        # Create search tab
+        search_tab = QWidget()
+        self.setup_search_tab(search_tab)
+        
         # Create calibration plots tab
         calibration_plots_tab = QWidget()
         self.setup_calibration_plots_tab(calibration_plots_tab)
         
+        # Create FP (Fundamental Parameters) tab
+        fp_tab = QWidget()
+        self.setup_fp_tab(fp_tab)
+        
         # Add tabs to tab widget
-        self.tab_widget.addTab(main_tab, "Main Workflow")
+        self.tab_widget.addTab(search_tab, "Search")
+        self.tab_widget.addTab(main_tab, "Quant")
         self.tab_widget.addTab(advanced_tab, "Calibrations")
         self.tab_widget.addTab(calibration_plots_tab, "Calibration Plots")
+        self.tab_widget.addTab(fp_tab, "FP Method")
         self.tab_widget.addTab(docs_export_tab, "Docs / Export")
         
         # Create right panel for plot
@@ -2174,6 +2384,7 @@ class XRFPeakFittingGUI(QMainWindow):
             self.single_file_label.setText(os.path.basename(file_path))
             self.current_file_path = file_path
             self.fit_single_btn.setEnabled(True)
+            # pb_as_deconv_btn removed - deconvolution is now automatic
             
             # Try to load and display the file
             self.load_and_display_file(file_path)
@@ -2205,6 +2416,10 @@ class XRFPeakFittingGUI(QMainWindow):
             
             x, y = data
             self.current_data = (x, y)
+            
+            # Ensure plot canvas is set up
+            if not hasattr(self.plot_canvas, 'ax1'):
+                self.plot_canvas.setup_subplots()
             
             # Display spectrum
             self.plot_canvas.plot_spectrum(x, y, title=f"XRF Spectrum - {os.path.basename(file_path)}")
@@ -2249,7 +2464,85 @@ class XRFPeakFittingGUI(QMainWindow):
                                   "Please select at least one element to analyze.")
                 return
             
-            # Analyze all selected elements
+            # Check if both Pb and As are selected - use automatic deconvolution
+            has_pb = 'Pb' in selected_elements
+            has_as = 'As' in selected_elements
+            
+            if has_pb and has_as:
+                # Automatically use Pb-As deconvolution
+                try:
+                    pb_results, as_results, x_fit, combined_fit, r_squared = self.peak_fitter.fit_pb_as_deconvolution(x, y)
+                    
+                    # Display deconvolution results
+                    results_text = f"🔬 Pb-As Deconvolution Results:\n"
+                    results_text += f"File: {os.path.basename(self.current_file_path)}\n"
+                    results_text += "=" * 50 + "\n\n"
+                    results_text += f"✨ Automatic deconvolution used (Pb + As detected)\n\n"
+                    
+                    results_text += f"LEAD (Pb):\n"
+                    results_text += f"  Lines Used: {', '.join(pb_results['lines_used'])}\n"
+                    results_text += f"  Amplitude: {pb_results['amplitude']:.2f} ± {pb_results['amplitude_error']:.2f}\n"
+                    results_text += f"  FWHM: {pb_results['fwhm']:.4f} keV\n"
+                    results_text += f"  Integrated Intensity: {pb_results['integrated_intensity']:.1f} cps\n"
+                    if pb_results['concentration']:
+                        results_text += f"  Concentration: {pb_results['concentration']:.2f} ppm\n\n"
+                    else:
+                        results_text += f"  Concentration: N/A (no calibration)\n\n"
+                    
+                    results_text += f"ARSENIC (As):\n"
+                    results_text += f"  Lines Used: {', '.join(as_results['lines_used'])}\n"
+                    results_text += f"  Amplitude: {as_results['amplitude']:.2f} ± {as_results['amplitude_error']:.2f}\n"
+                    results_text += f"  FWHM: {as_results['fwhm']:.4f} keV\n"
+                    results_text += f"  Integrated Intensity: {as_results['integrated_intensity']:.1f} cps\n"
+                    if as_results['concentration']:
+                        results_text += f"  Concentration: {as_results['concentration']:.2f} ppm\n\n"
+                    else:
+                        results_text += f"  Concentration: N/A (no calibration)\n\n"
+                    
+                    results_text += f"Fit Quality: R² = {r_squared:.6f}\n"
+                    
+                    if pb_results['concentration'] and as_results['concentration']:
+                        results_text += f"Pb/As Ratio: {pb_results['concentration']/as_results['concentration']:.2f}\n"
+                    
+                    self.results_text.clear()
+                    self.results_text.append(results_text)
+                    
+                    # Plot deconvolution results
+                    self.plot_canvas.figure.clear()
+                    ax = self.plot_canvas.figure.add_subplot(111)
+                    
+                    ax.plot(x, y, 'b-', linewidth=0.8, alpha=0.5, label='Original Spectrum')
+                    ax.plot(x_fit, combined_fit, 'r-', linewidth=2, label=f'Combined Fit (R²={r_squared:.4f})')
+                    
+                    # Mark characteristic lines
+                    pb_lines = [10.5515, 10.4495, 12.6137]
+                    as_lines = [10.5437, 10.5078, 11.7262]
+                    
+                    for energy in pb_lines:
+                        ax.axvline(energy, color='green', linestyle='--', alpha=0.5, linewidth=1)
+                    for energy in as_lines:
+                        ax.axvline(energy, color='orange', linestyle='--', alpha=0.5, linewidth=1)
+                    
+                    ax.plot([], [], 'g--', alpha=0.5, label='Pb L-lines')
+                    ax.plot([], [], color='orange', linestyle='--', alpha=0.5, label='As K-lines')
+                    
+                    ax.set_xlabel('Energy (keV)', fontsize=10)
+                    ax.set_ylabel('Counts', fontsize=10)
+                    ax.set_title('Pb-As Deconvolution (Automatic)', fontsize=12, fontweight='bold')
+                    ax.set_xlim(9.5, 13.5)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(loc='best')
+                    
+                    self.plot_canvas.figure.tight_layout()
+                    self.plot_canvas.draw()
+                    
+                    return  # Exit after deconvolution
+                    
+                except Exception as e:
+                    QMessageBox.warning(self, "Deconvolution Failed", 
+                                      f"Pb-As deconvolution failed: {str(e)}\n\nFalling back to individual fits.")
+            
+            # Standard multi-element fitting (not Pb+As together)
             results_text = f"Multi-Element Fit Results:\n"
             results_text += f"File: {os.path.basename(self.current_file_path)}\n"
             results_text += "=" * 50 + "\n\n"
@@ -2295,8 +2588,8 @@ class XRFPeakFittingGUI(QMainWindow):
                     results_text += f"{element}: Fit failed - {str(e)}\n\n"
             
             # Display results
-            self.fit_results_text.clear()
-            self.fit_results_text.append(results_text)
+            self.results_text.clear()
+            self.results_text.append(results_text)
             
             # Plot the first element's fit (for visualization)
             if selected_elements and selected_elements[0] in all_results:
@@ -2320,10 +2613,12 @@ class XRFPeakFittingGUI(QMainWindow):
                                                             fit_params['background_slope'], 
                                                             fit_params['background_intercept'])
                 
-                # Update plot
+                # Ensure plot canvas is initialized
                 if not hasattr(self.plot_canvas, 'ax1'):
                     self.plot_canvas.setup_subplots()
+                    self.plot_canvas.setup_zoom_events()
                 
+                # Plot the spectrum with fit
                 self.plot_canvas.plot_spectrum(
                     x, y, 
                     fit_x=x_fit, 
@@ -2388,6 +2683,122 @@ class XRFPeakFittingGUI(QMainWindow):
         filename = os.path.basename(file_path)
         self.results_text.append(f"ERROR: {filename} - {error_msg}")
     
+    def run_pb_as_deconvolution(self):
+        """Run Pb-As deconvolution on the loaded spectrum"""
+        if not hasattr(self, 'current_data') or self.current_data is None:
+            QMessageBox.warning(self, "Error", "No file loaded. Please select a file first.")
+            return
+        
+        try:
+            x, y = self.current_data
+            
+            # Check if we have calibrations for both Pb and As
+            has_pb_cal = self.calibration_manager.has_calibration('Pb')
+            has_as_cal = self.calibration_manager.has_calibration('As')
+            
+            if not has_pb_cal or not has_as_cal:
+                missing = []
+                if not has_pb_cal:
+                    missing.append('Pb')
+                if not has_as_cal:
+                    missing.append('As')
+                
+                response = QMessageBox.question(
+                    self, "Missing Calibrations",
+                    f"No calibration found for: {', '.join(missing)}\n\n"
+                    f"Deconvolution will proceed, but concentrations cannot be calculated.\n"
+                    f"Continue anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if response == QMessageBox.StandardButton.No:
+                    return
+            
+            # Run deconvolution
+            pb_results, as_results, x_fit, combined_fit, r_squared = self.peak_fitter.fit_pb_as_deconvolution(x, y)
+            
+            # Plot results
+            self.plot_canvas.figure.clear()
+            ax = self.plot_canvas.figure.add_subplot(111)
+            
+            # Plot original spectrum
+            ax.plot(x, y, 'b-', linewidth=0.8, alpha=0.5, label='Original Spectrum')
+            
+            # Plot fitted curve
+            ax.plot(x_fit, combined_fit, 'r-', linewidth=2, label=f'Combined Fit (R²={r_squared:.4f})')
+            
+            # Mark characteristic lines
+            pb_lines = [10.5515, 10.4495, 12.6137]  # Lα1, Lα2, Lβ1
+            as_lines = [10.5437, 10.5078, 11.7262]  # Kα1, Kα2, Kβ1
+            
+            for energy in pb_lines:
+                ax.axvline(energy, color='green', linestyle='--', alpha=0.5, linewidth=1)
+            for energy in as_lines:
+                ax.axvline(energy, color='orange', linestyle='--', alpha=0.5, linewidth=1)
+            
+            # Add legend entries for lines
+            ax.plot([], [], 'g--', alpha=0.5, label='Pb L-lines')
+            ax.plot([], [], color='orange', linestyle='--', alpha=0.5, label='As K-lines')
+            
+            ax.set_xlabel('Energy (keV)', fontsize=10)
+            ax.set_ylabel('Counts', fontsize=10)
+            ax.set_title('Pb-As Deconvolution', fontsize=12, fontweight='bold')
+            ax.set_xlim(9.5, 13.5)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best')
+            
+            self.plot_canvas.figure.tight_layout()
+            self.plot_canvas.draw()
+            
+            # Display results
+            results_text = f"""
+=== Pb-As DECONVOLUTION RESULTS ===
+File: {os.path.basename(self.current_file_path)}
+Fit Quality: R² = {r_squared:.6f}
+
+LEAD (Pb):
+  Lines Used: {', '.join(pb_results['lines_used'])}
+  Amplitude: {pb_results['amplitude']:.2f} ± {pb_results['amplitude_error']:.2f}
+  FWHM: {pb_results['fwhm']:.4f} ± {pb_results['fwhm_error']:.4f} keV
+  Integrated Intensity: {pb_results['integrated_intensity']:.1f} cps
+  Concentration: {pb_results['concentration']:.2f} ppm""" if pb_results['concentration'] else "  Concentration: N/A (no calibration)"
+            
+            results_text += f"""
+
+ARSENIC (As):
+  Lines Used: {', '.join(as_results['lines_used'])}
+  Amplitude: {as_results['amplitude']:.2f} ± {as_results['amplitude_error']:.2f}
+  FWHM: {as_results['fwhm']:.4f} ± {as_results['fwhm_error']:.4f} keV
+  Integrated Intensity: {as_results['integrated_intensity']:.1f} cps
+  Concentration: {as_results['concentration']:.2f} ppm""" if as_results['concentration'] else "  Concentration: N/A (no calibration)"
+            
+            results_text += f"""
+
+NOTES:
+  • Pb Lα1 (10.5515 keV) and As Kα1 (10.5437 keV) overlap
+  • Deconvolution uses all characteristic lines with theoretical intensity ratios
+  • Pb Lβ1 (12.6 keV) and As Kβ1 (11.7 keV) are well separated
+  • Both elements quantified simultaneously
+"""
+            
+            self.results_text.setText(results_text)
+            
+            # Show success message
+            msg = f"Deconvolution successful!\n\n"
+            if pb_results['concentration'] and as_results['concentration']:
+                msg += f"Pb: {pb_results['concentration']:.2f} ppm\n"
+                msg += f"As: {as_results['concentration']:.2f} ppm\n"
+                msg += f"Pb/As ratio: {pb_results['concentration']/as_results['concentration']:.2f}"
+            else:
+                msg += "Integrated intensities calculated.\nAdd calibrations to get concentrations."
+            
+            QMessageBox.information(self, "Deconvolution Complete", msg)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Deconvolution Failed", 
+                               f"Failed to perform Pb-As deconvolution:\n{str(e)}\n\n"
+                               f"Make sure the spectrum covers the 10-13 keV range.")
+    
     def on_batch_finished(self, results, sample_groups):
         """Handle batch processing completion"""
         # Ensure progress bar reaches 100%
@@ -2413,14 +2824,15 @@ class XRFPeakFittingGUI(QMainWindow):
             
             # Display multi-element summary
             self.display_multi_element_summary(results, sample_groups)
+            
+            # Plot concentration evolution for all elements
+            self.plot_multi_element_concentration_evolution(results, sample_groups)
         else:
             # Display single-element sample statistics
             self.display_sample_statistics(sample_groups)
             
-            # Automatically show sample statistics plot
-            if sample_groups:
-                self.plot_canvas.setup_subplots()
-                self.plot_canvas.plot_sample_statistics(sample_groups)
+            # Plot concentration evolution for single element
+            self.plot_concentration_evolution(results, sample_groups)
             
             # Display single-element summary
             successful = len([r for r in results if 'fit_params' in r])
@@ -2467,6 +2879,130 @@ Calibrated Concentration: {concentration:.4f}
             self.results_text.append(f"  Concentration SD: {group.std_concentration:.4f}")
             self.results_text.append(f"  Concentration SEM: {group.sem_concentration:.4f}")
             self.results_text.append(f"  Concentration RSD (%): {group.rsd_concentration:.2f}")
+    
+    def plot_concentration_evolution(self, results, sample_groups):
+        """Plot concentration evolution across all spectra for single element"""
+        try:
+            # Clear and setup figure
+            self.plot_canvas.figure.clear()
+            
+            # Create two subplots: concentration evolution and sample statistics
+            ax1 = self.plot_canvas.figure.add_subplot(2, 1, 1)
+            ax2 = self.plot_canvas.figure.add_subplot(2, 1, 2)
+            
+            # Extract concentrations and file names
+            concentrations = []
+            file_names = []
+            for result in results:
+                if 'concentration' in result:
+                    concentrations.append(result['concentration'])
+                    file_names.append(os.path.basename(result['file_path']))
+            
+            if not concentrations:
+                return
+            
+            # Plot 1: Concentration evolution
+            x_indices = np.arange(len(concentrations))
+            ax1.plot(x_indices, concentrations, 'bo-', linewidth=1.5, markersize=6, alpha=0.7)
+            ax1.set_xlabel('Spectrum Index', fontsize=10)
+            ax1.set_ylabel('Concentration (ppm)', fontsize=10)
+            ax1.set_title('Concentration Evolution Across All Spectra', fontsize=11, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            
+            # Add mean line
+            mean_conc = np.mean(concentrations)
+            ax1.axhline(mean_conc, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Mean: {mean_conc:.2f} ppm')
+            ax1.legend()
+            
+            # Plot 2: Sample statistics (bar plot with error bars)
+            if sample_groups:
+                sample_names = [g.sample_name for g in sample_groups]
+                means = [g.mean_concentration for g in sample_groups]
+                sems = [g.sem_concentration for g in sample_groups]
+                
+                x_pos = np.arange(len(sample_names))
+                bars = ax2.bar(x_pos, means, yerr=sems, capsize=5, alpha=0.7, edgecolor='black', linewidth=1.5)
+                
+                # Color bars by value
+                colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(means)))
+                for bar, color in zip(bars, colors):
+                    bar.set_color(color)
+                
+                ax2.set_xlabel('Sample', fontsize=10)
+                ax2.set_ylabel('Concentration (ppm)', fontsize=10)
+                ax2.set_title('Sample Statistics (Mean ± SEM)', fontsize=11, fontweight='bold')
+                ax2.set_xticks(x_pos)
+                ax2.set_xticklabels(sample_names, rotation=45, ha='right')
+                ax2.grid(True, alpha=0.3, axis='y')
+            
+            self.plot_canvas.figure.tight_layout()
+            self.plot_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error plotting concentration evolution: {e}")
+    
+    def plot_multi_element_concentration_evolution(self, results, sample_groups):
+        """Plot concentration evolution for multiple elements"""
+        try:
+            # Get all elements
+            if not results or 'element_results' not in results[0]:
+                return
+            
+            elements = list(results[0]['element_results'].keys())
+            n_elements = len(elements)
+            
+            if n_elements == 0:
+                return
+            
+            # Clear and setup figure
+            self.plot_canvas.figure.clear()
+            
+            # Determine grid layout
+            if n_elements == 1:
+                rows, cols = 1, 1
+            elif n_elements == 2:
+                rows, cols = 1, 2
+            elif n_elements <= 4:
+                rows, cols = 2, 2
+            elif n_elements <= 6:
+                rows, cols = 2, 3
+            else:
+                rows, cols = 3, 3
+            
+            # Plot each element
+            for idx, element in enumerate(elements[:9]):  # Limit to 9 elements
+                ax = self.plot_canvas.figure.add_subplot(rows, cols, idx + 1)
+                
+                # Extract concentrations for this element
+                concentrations = []
+                for result in results:
+                    elem_result = result['element_results'].get(element, {})
+                    if 'concentration' in elem_result:
+                        concentrations.append(elem_result['concentration'])
+                
+                if not concentrations:
+                    continue
+                
+                # Plot concentration evolution
+                x_indices = np.arange(len(concentrations))
+                ax.plot(x_indices, concentrations, 'o-', linewidth=1.5, markersize=5, alpha=0.7)
+                
+                # Add mean line
+                mean_conc = np.mean(concentrations)
+                ax.axhline(mean_conc, color='red', linestyle='--', linewidth=1.5, alpha=0.6)
+                
+                ax.set_xlabel('Spectrum #', fontsize=8)
+                ax.set_ylabel('Conc. (ppm)', fontsize=8)
+                ax.set_title(f'{element} - Mean: {mean_conc:.1f} ppm', fontsize=9, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(labelsize=7)
+            
+            self.plot_canvas.figure.suptitle('Multi-Element Concentration Evolution', fontsize=12, fontweight='bold')
+            self.plot_canvas.figure.tight_layout()
+            self.plot_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error plotting multi-element concentration evolution: {e}")
     
     def export_individual_results(self):
         """Export individual spectrum results to CSV"""
@@ -2557,8 +3093,15 @@ Calibrated Concentration: {concentration:.4f}
         if not self.batch_results:
             return
         
-        # Filter successful results
-        self.filtered_results = [r for r in self.batch_results if 'fit_params' in r]
+        # Check if multi-element or single-element results
+        is_multi_element = (self.batch_results and 'element_results' in self.batch_results[0])
+        
+        if is_multi_element:
+            # For multi-element, filter results that have at least one successful element fit
+            self.filtered_results = [r for r in self.batch_results if 'element_results' in r and r['element_results']]
+        else:
+            # For single-element, filter successful results
+            self.filtered_results = [r for r in self.batch_results if 'fit_params' in r]
         
         if not self.filtered_results:
             return
@@ -2589,15 +3132,38 @@ Calibrated Concentration: {concentration:.4f}
         
         result = self.filtered_results[self.current_spectrum_index]
         
-        # Extract data
-        x = result['x_data']
-        y = result['y_data']
-        fit_x = result['fit_x']
-        fit_y = result['fit_y']
-        filename = result['filename']
-        fit_params = result['fit_params']
-        r_squared = result['r_squared']
-        concentration = result['concentration']
+        # Check if multi-element result
+        is_multi_element = 'element_results' in result
+        
+        if is_multi_element:
+            # For multi-element, show the first element's fit
+            x = result['x_data']
+            y = result['y_data']
+            filename = result['filename']
+            
+            # Get first element's results
+            element_results = result['element_results']
+            if not element_results:
+                return
+            
+            first_element = list(element_results.keys())[0]
+            elem_result = element_results[first_element]
+            
+            fit_x = elem_result.get('fit_x')
+            fit_y = elem_result.get('fit_y')
+            fit_params = elem_result.get('fit_params')
+            r_squared = elem_result.get('r_squared', 0)
+            concentration = elem_result.get('concentration', 0)
+        else:
+            # Single element result
+            x = result['x_data']
+            y = result['y_data']
+            fit_x = result['fit_x']
+            fit_y = result['fit_y']
+            filename = result['filename']
+            fit_params = result['fit_params']
+            r_squared = result['r_squared']
+            concentration = result['concentration']
         
         # Store current data for zoom updates
         self.current_data = (x, y)
@@ -3294,30 +3860,611 @@ Calibrated Concentration: {concentration:.4f}
             row_index = elements.index(element_symbol)
             self.ref_materials_table.selectRow(row_index)
     
-    def setup_calibration_plots_tab(self, tab):
-        """Setup the calibration plots visualization tab"""
+    def setup_search_tab(self, tab):
+        """Setup the element search/identification tab"""
         layout = QVBoxLayout(tab)
         
-        # Element selector
-        selector_layout = QHBoxLayout()
-        selector_layout.addWidget(QLabel("Select Element:"))
+        # Instructions
+        info_label = QLabel(
+            "🔍 <b>Element Search</b><br>"
+            "Load a spectrum file to automatically identify possible elements based on detected peaks. "
+            "The tool will match peak energies against the XRF lines database (Na to U)."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("""
+            QLabel {
+                background-color: #E8F5E9;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 11px;
+            }
+        """)
+        layout.addWidget(info_label)
         
-        self.cal_plot_element_combo = QComboBox()
-        for symbol, data in ELEMENT_DEFINITIONS.items():
-            self.cal_plot_element_combo.addItem(f"{symbol} ({data['name']})")
-        self.cal_plot_element_combo.currentTextChanged.connect(self.update_calibration_plot)
-        selector_layout.addWidget(self.cal_plot_element_combo)
+        # File loading section
+        file_group = QGroupBox("Load Spectrum")
+        file_layout = QHBoxLayout(file_group)
         
-        refresh_btn = QPushButton("🔄 Refresh Plot")
-        refresh_btn.clicked.connect(self.update_calibration_plot)
-        selector_layout.addWidget(refresh_btn)
+        self.search_file_label = QLabel("No file loaded")
+        self.search_file_label.setStyleSheet("color: gray;")
+        file_layout.addWidget(self.search_file_label)
         
-        selector_layout.addStretch()
-        layout.addLayout(selector_layout)
+        load_file_btn = QPushButton("📁 Load Spectrum File")
+        load_file_btn.clicked.connect(self.load_spectrum_for_search)
+        file_layout.addWidget(load_file_btn)
         
-        # Calibration info display
-        self.cal_info_label = QLabel("Select an element to view its calibration curve")
-        self.cal_info_label.setStyleSheet("""
+        self.send_to_quant_btn = QPushButton("➡️ Send to Quant Tab")
+        self.send_to_quant_btn.setEnabled(False)
+        self.send_to_quant_btn.clicked.connect(self.send_spectrum_to_quant)
+        self.send_to_quant_btn.setToolTip("Send loaded spectrum to Quant tab for analysis")
+        self.send_to_quant_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        file_layout.addWidget(self.send_to_quant_btn)
+        
+        layout.addWidget(file_group)
+        
+        # Peak detection parameters
+        params_group = QGroupBox("Peak Detection Parameters")
+        params_layout = QGridLayout(params_group)
+        
+        params_layout.addWidget(QLabel("Energy Tolerance (keV):"), 0, 0)
+        self.search_energy_tolerance = QDoubleSpinBox()
+        self.search_energy_tolerance.setRange(0.01, 1.0)
+        self.search_energy_tolerance.setValue(0.1)
+        self.search_energy_tolerance.setSingleStep(0.01)
+        self.search_energy_tolerance.setDecimals(2)
+        params_layout.addWidget(self.search_energy_tolerance, 0, 1)
+        
+        params_layout.addWidget(QLabel("Min Peak Height (cps):"), 1, 0)
+        self.search_min_height = QSpinBox()
+        self.search_min_height.setRange(10, 10000)
+        self.search_min_height.setValue(100)
+        self.search_min_height.setSingleStep(10)
+        params_layout.addWidget(self.search_min_height, 1, 1)
+        
+        params_layout.addWidget(QLabel("Min Relative Intensity:"), 2, 0)
+        self.search_min_rel_intensity = QSpinBox()
+        self.search_min_rel_intensity.setRange(0, 100)
+        self.search_min_rel_intensity.setValue(50)
+        self.search_min_rel_intensity.setSuffix("%")
+        params_layout.addWidget(self.search_min_rel_intensity, 2, 1)
+        
+        # Baseline subtraction options
+        params_layout.addWidget(QLabel("Baseline Subtraction:"), 3, 0)
+        self.search_baseline_method = QComboBox()
+        self.search_baseline_method.addItems(["None", "Linear", "Polynomial", "SNIP"])
+        self.search_baseline_method.setCurrentText("None")
+        params_layout.addWidget(self.search_baseline_method, 3, 1)
+        
+        params_layout.addWidget(QLabel("Baseline Iterations:"), 4, 0)
+        self.search_baseline_iterations = QSpinBox()
+        self.search_baseline_iterations.setRange(1, 50)
+        self.search_baseline_iterations.setValue(10)
+        self.search_baseline_iterations.setEnabled(False)
+        self.search_baseline_iterations.setToolTip("Number of iterations for SNIP algorithm")
+        params_layout.addWidget(self.search_baseline_iterations, 4, 1)
+        
+        # Enable/disable iterations based on method
+        self.search_baseline_method.currentTextChanged.connect(self.on_baseline_method_changed)
+        
+        # X-ray tube filter
+        params_layout.addWidget(QLabel("X-ray Tube Element:"), 6, 0)
+        self.search_tube_element = QComboBox()
+        self.search_tube_element.addItems(["None", "Rh (Rhodium)", "W (Tungsten)", "Mo (Molybdenum)", "Cr (Chromium)", "Ag (Silver)"])
+        self.search_tube_element.setCurrentText("Rh (Rhodium)")
+        self.search_tube_element.setToolTip("Exclude X-ray tube element lines from search results")
+        params_layout.addWidget(self.search_tube_element, 6, 1)
+        
+        search_btn = QPushButton("🔎 Search for Elements")
+        search_btn.clicked.connect(self.search_for_elements)
+        params_layout.addWidget(search_btn, 7, 0, 1, 2)
+        
+        layout.addWidget(params_group)
+        
+        # Detected elements list
+        elements_group = QGroupBox("Detected Elements")
+        elements_layout = QVBoxLayout(elements_group)
+        
+        self.detected_elements_table = QTableWidget(0, 7)
+        self.detected_elements_table.setHorizontalHeaderLabels(['Element', 'Z', 'Lines', 'Energies (keV)', 'Peak Heights', 'Confidence', '# Matches'])
+        self.detected_elements_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.detected_elements_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.detected_elements_table.itemSelectionChanged.connect(self.on_detected_element_selected)
+        elements_layout.addWidget(self.detected_elements_table)
+        
+        layout.addWidget(elements_group)
+        
+        # Peak details table
+        details_group = QGroupBox("Peak Details for Selected Element")
+        details_layout = QVBoxLayout(details_group)
+        
+        self.peak_details_table = QTableWidget(0, 5)
+        self.peak_details_table.setHorizontalHeaderLabels(['Line', 'Expected (keV)', 'Detected (keV)', 'Δ (keV)', 'Rel. Intensity'])
+        self.peak_details_table.setMaximumHeight(150)
+        details_layout.addWidget(self.peak_details_table)
+        
+        layout.addWidget(details_group)
+        
+        # Store search results
+        self.search_spectrum_data = None
+        self.search_detected_peaks = []
+        self.search_element_matches = {}
+        self.search_baseline_subtracted = None
+    
+    def on_baseline_method_changed(self):
+        """Enable/disable baseline iterations based on selected method"""
+        method = self.search_baseline_method.currentText()
+        self.search_baseline_iterations.setEnabled(method == "SNIP")
+    
+    def apply_baseline_subtraction(self, energy, counts, method):
+        """Apply baseline subtraction to spectrum data"""
+        if method == "Linear":
+            # Simple linear baseline from first to last point
+            baseline = np.linspace(counts[0], counts[-1], len(counts))
+            return counts - baseline
+        
+        elif method == "Polynomial":
+            # Polynomial baseline (degree 3)
+            from scipy.signal import savgol_filter
+            # Smooth the data first
+            smoothed = savgol_filter(counts, window_length=51, polyorder=3)
+            # Use minimum values as baseline estimate
+            baseline = np.minimum.accumulate(smoothed)
+            baseline = np.minimum.accumulate(baseline[::-1])[::-1]
+            return np.maximum(counts - baseline, 0)
+        
+        elif method == "SNIP":
+            # Statistics-sensitive Non-linear Iterative Peak-clipping
+            iterations = self.search_baseline_iterations.value()
+            return self.snip_baseline(counts, iterations)
+        
+        return counts
+    
+    def snip_baseline(self, spectrum, iterations):
+        """
+        SNIP (Statistics-sensitive Non-linear Iterative Peak-clipping) algorithm
+        for baseline estimation in XRF spectra
+        """
+        import numpy as np
+        
+        # Work with log-transformed spectrum
+        spectrum = np.array(spectrum, dtype=float)
+        # Avoid log(0) by adding small value
+        spectrum_log = np.log(np.log(np.sqrt(spectrum + 1) + 1) + 1)
+        
+        # Apply SNIP algorithm
+        working = np.copy(spectrum_log)
+        
+        for p in range(1, iterations + 1):
+            for i in range(p, len(working) - p):
+                a = working[i]
+                b = (working[i - p] + working[i + p]) / 2.0
+                if b < a:
+                    working[i] = b
+        
+        # Transform back
+        baseline = (np.exp(np.exp(working) - 1) - 1) ** 2 - 1
+        
+        # Ensure baseline doesn't exceed original spectrum
+        baseline = np.minimum(baseline, spectrum)
+        
+        # Subtract baseline
+        corrected = spectrum - baseline
+        
+        return np.maximum(corrected, 0)
+    
+    def load_spectrum_for_search(self):
+        """Load a spectrum file for element search"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Spectrum File", "", "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                # Parse the spectrum file using existing parser
+                energy, counts, format_type = parse_xrf_file_smart(file_path)
+                
+                if energy is None or counts is None:
+                    raise Exception("Could not parse spectrum file")
+                
+                self.search_spectrum_data = {'energy': energy, 'counts': counts, 'file_path': file_path}
+                
+                # Update UI
+                file_name = os.path.basename(file_path)
+                self.search_file_label.setText(f"✓ {file_name} ({format_type})")
+                self.search_file_label.setStyleSheet("color: green; font-weight: bold;")
+                self.send_to_quant_btn.setEnabled(True)
+                
+                # Plot the spectrum on the main plot canvas
+                self.plot_search_spectrum()
+                
+                QMessageBox.information(self, "Success", f"Spectrum loaded successfully!\n{len(energy)} data points\nFormat: {format_type}")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load spectrum:\n{str(e)}")
+    
+    def send_spectrum_to_quant(self):
+        """Send the loaded spectrum from Search tab to Quant tab"""
+        if self.search_spectrum_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrum loaded to send.")
+            return
+        
+        # Set the data in Quant tab
+        file_path = self.search_spectrum_data['file_path']
+        self.current_file_path = file_path
+        self.current_data = (self.search_spectrum_data['energy'], self.search_spectrum_data['counts'])
+        
+        # Update Quant tab UI
+        self.single_file_label.setText(os.path.basename(file_path))
+        self.fit_single_btn.setEnabled(True)
+        # pb_as_deconv_btn removed - deconvolution is now automatic
+        
+        # Load and display in Quant tab
+        self.load_and_display_file(file_path)
+        
+        # Switch to Quant tab
+        self.tab_widget.setCurrentIndex(1)  # Quant is tab index 1
+        
+        QMessageBox.information(self, "Success", 
+                              f"Spectrum sent to Quant tab!\n\n"
+                              f"File: {os.path.basename(file_path)}\n"
+                              f"You can now fit peaks for selected elements.")
+    
+    def plot_search_spectrum(self, highlight_peaks=None):
+        """Plot the loaded spectrum with optional peak highlights"""
+        if self.search_spectrum_data is None:
+            return
+        
+        # Use the main plot canvas on the right
+        self.plot_canvas.figure.clear()
+        ax = self.plot_canvas.figure.add_subplot(111)
+        
+        energy = self.search_spectrum_data['energy']
+        counts = self.search_spectrum_data['counts']
+        
+        # Plot original spectrum
+        ax.plot(energy, counts, 'b-', linewidth=0.8, alpha=0.5, label='Original')
+        
+        # Plot baseline-subtracted spectrum if available
+        if self.search_baseline_subtracted is not None:
+            ax.plot(energy, self.search_baseline_subtracted, 'g-', linewidth=0.8, alpha=0.7, label='Baseline Corrected')
+            plot_data = self.search_baseline_subtracted
+        else:
+            plot_data = counts
+        
+        # Highlight detected peaks if available
+        if highlight_peaks:
+            for peak in highlight_peaks:
+                ax.axvline(peak['energy'], color='red', linestyle='--', alpha=0.5, linewidth=1)
+                ax.plot(peak['energy'], peak['height'], 'ro', markersize=8)
+        
+        ax.set_xlabel('Energy (keV)', fontsize=10)
+        ax.set_ylabel('Counts', fontsize=10)
+        ax.set_title('XRF Spectrum - Search Mode', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        
+        self.plot_canvas.figure.tight_layout()
+        self.plot_canvas.draw()
+    
+    def search_for_elements(self):
+        """Search for elements based on detected peaks in the spectrum"""
+        if self.search_spectrum_data is None:
+            QMessageBox.warning(self, "No Data", "Please load a spectrum file first.")
+            return
+        
+        energy = self.search_spectrum_data['energy']
+        counts = self.search_spectrum_data['counts']
+        
+        # Apply baseline subtraction if selected
+        baseline_method = self.search_baseline_method.currentText()
+        if baseline_method != "None":
+            counts_corrected = self.apply_baseline_subtraction(energy, counts, baseline_method)
+            self.search_baseline_subtracted = counts_corrected
+        else:
+            counts_corrected = counts
+            self.search_baseline_subtracted = None
+        
+        # Detect peaks
+        from scipy.signal import find_peaks
+        
+        min_height = self.search_min_height.value()
+        peaks, properties = find_peaks(counts_corrected, height=min_height, distance=10, prominence=min_height*0.3)
+        
+        if len(peaks) == 0:
+            QMessageBox.warning(self, "No Peaks", "No peaks detected. Try lowering the minimum height threshold.")
+            return
+        
+        # Store detected peaks
+        self.search_detected_peaks = []
+        for i, peak_idx in enumerate(peaks):
+            self.search_detected_peaks.append({
+                'energy': energy[peak_idx],
+                'height': counts_corrected[peak_idx],
+                'index': peak_idx
+            })
+        
+        # Match peaks to elements
+        tolerance = self.search_energy_tolerance.value()
+        min_rel_intensity = self.search_min_rel_intensity.value()
+        
+        # Get tube element to exclude
+        tube_element_text = self.search_tube_element.currentText()
+        if tube_element_text != "None":
+            tube_element = tube_element_text.split()[0]  # Extract symbol (e.g., "Rh" from "Rh (Rhodium)")
+        else:
+            tube_element = None
+        
+        element_matches = {}
+        
+        for element, lines in XRF_LINES_DB.items():
+            # Skip X-ray tube element
+            if tube_element and element == tube_element:
+                continue
+            
+            matched_lines = []
+            
+            for line in lines:
+                # Only consider lines with sufficient relative intensity
+                if line['Relative_Intensity'] < min_rel_intensity:
+                    continue
+                
+                expected_energy = line['Energy_keV']
+                
+                # Check if any detected peak matches this line
+                for peak in self.search_detected_peaks:
+                    if abs(peak['energy'] - expected_energy) <= tolerance:
+                        matched_lines.append({
+                            'line': line['Line'],
+                            'expected_energy': expected_energy,
+                            'detected_energy': peak['energy'],
+                            'delta': peak['energy'] - expected_energy,
+                            'rel_intensity': line['Relative_Intensity'],
+                            'peak_height': peak['height']
+                        })
+                        break
+            
+            if matched_lines:
+                # Require at least 2 matched lines for confident identification
+                # Exception: if only 1 line but it's very strong (>90% relative intensity)
+                num_lines = len(matched_lines)
+                
+                if num_lines >= 2:
+                    # Multiple lines matched - high confidence
+                    # Base confidence on number of lines and their relative intensities
+                    base_confidence = min(70, num_lines * 25)
+                    intensity_bonus = sum(m['rel_intensity'] for m in matched_lines) / len(matched_lines) * 0.3
+                    confidence = min(100, base_confidence + intensity_bonus)
+                elif num_lines == 1 and matched_lines[0]['rel_intensity'] >= 90:
+                    # Single very strong line - moderate confidence
+                    confidence = 60
+                else:
+                    # Single weak line - skip this element
+                    continue
+                
+                element_matches[element] = {
+                    'atomic_number': lines[0]['Atomic_Number'],
+                    'matched_lines': matched_lines,
+                    'confidence': confidence,
+                    'all_lines': lines  # Store all lines for plotting
+                }
+        
+        self.search_element_matches = element_matches
+        
+        # Update results table
+        self.update_detected_elements_table()
+        
+        # Plot spectrum with highlighted peaks
+        self.plot_search_spectrum(highlight_peaks=self.search_detected_peaks)
+        
+        # Prepare result message
+        result_msg = f"Found {len(peaks)} peaks in spectrum.\n"
+        result_msg += f"Identified {len(element_matches)} possible elements."
+        
+        if tube_element:
+            result_msg += f"\n\n✓ Filtered out {tube_element} (X-ray tube) lines"
+        
+        QMessageBox.information(self, "Search Complete", result_msg)
+    
+    def update_detected_elements_table(self):
+        """Update the table showing detected elements"""
+        self.detected_elements_table.setRowCount(0)
+        
+        # Sort by confidence
+        sorted_elements = sorted(self.search_element_matches.items(), 
+                                key=lambda x: x[1]['confidence'], reverse=True)
+        
+        for element, data in sorted_elements:
+            row = self.detected_elements_table.rowCount()
+            self.detected_elements_table.insertRow(row)
+            
+            # Element symbol
+            elem_item = QTableWidgetItem(element)
+            elem_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.detected_elements_table.setItem(row, 0, elem_item)
+            
+            # Atomic number
+            z_item = QTableWidgetItem(str(data['atomic_number']))
+            z_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.detected_elements_table.setItem(row, 1, z_item)
+            
+            # Emission lines (e.g., "Kα1, Kβ1")
+            matched_lines = data['matched_lines']
+            lines_str = ', '.join([line['line'] for line in matched_lines])
+            lines_item = QTableWidgetItem(lines_str)
+            self.detected_elements_table.setItem(row, 2, lines_item)
+            
+            # Energies
+            energies_str = ', '.join([f"{line['detected_energy']:.3f}" for line in matched_lines])
+            energies_item = QTableWidgetItem(energies_str)
+            self.detected_elements_table.setItem(row, 3, energies_item)
+            
+            # Peak heights
+            heights_str = ', '.join([f"{line['peak_height']:.0f}" for line in matched_lines])
+            heights_item = QTableWidgetItem(heights_str)
+            self.detected_elements_table.setItem(row, 4, heights_item)
+            
+            # Confidence
+            conf_item = QTableWidgetItem(f"{data['confidence']:.0f}%")
+            conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            # Color code by confidence
+            if data['confidence'] >= 80:
+                conf_item.setBackground(QColor(144, 238, 144))  # Light green
+            elif data['confidence'] >= 50:
+                conf_item.setBackground(QColor(255, 255, 200))  # Light yellow
+            else:
+                conf_item.setBackground(QColor(255, 200, 200))  # Light red
+            
+            self.detected_elements_table.setItem(row, 5, conf_item)
+            
+            # Number of matched lines
+            num_lines_item = QTableWidgetItem(str(len(matched_lines)))
+            num_lines_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.detected_elements_table.setItem(row, 6, num_lines_item)
+        
+        self.detected_elements_table.resizeColumnsToContents()
+    
+    def on_detected_element_selected(self):
+        """Handle selection of a detected element"""
+        selected_rows = self.detected_elements_table.selectedItems()
+        if not selected_rows:
+            return
+        
+        row = selected_rows[0].row()
+        element = self.detected_elements_table.item(row, 0).text()
+        
+        if element in self.search_element_matches:
+            self.update_peak_details_table(element)
+            self.plot_spectrum_with_element_lines(element)
+    
+    def update_peak_details_table(self, element):
+        """Update the peak details table for selected element"""
+        self.peak_details_table.setRowCount(0)
+        
+        if element not in self.search_element_matches:
+            return
+        
+        matched_lines = self.search_element_matches[element]['matched_lines']
+        
+        for line_data in matched_lines:
+            row = self.peak_details_table.rowCount()
+            self.peak_details_table.insertRow(row)
+            
+            # Line type
+            self.peak_details_table.setItem(row, 0, QTableWidgetItem(line_data['line']))
+            
+            # Expected energy
+            exp_item = QTableWidgetItem(f"{line_data['expected_energy']:.4f}")
+            exp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.peak_details_table.setItem(row, 1, exp_item)
+            
+            # Detected energy
+            det_item = QTableWidgetItem(f"{line_data['detected_energy']:.4f}")
+            det_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.peak_details_table.setItem(row, 2, det_item)
+            
+            # Delta
+            delta_item = QTableWidgetItem(f"{line_data['delta']:.4f}")
+            delta_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.peak_details_table.setItem(row, 3, delta_item)
+            
+            # Relative intensity
+            rel_item = QTableWidgetItem(f"{line_data['rel_intensity']}")
+            rel_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.peak_details_table.setItem(row, 4, rel_item)
+        
+        self.peak_details_table.resizeColumnsToContents()
+    
+    def plot_spectrum_with_element_lines(self, element):
+        """Plot spectrum with ALL characteristic lines for the selected element"""
+        if self.search_spectrum_data is None or element not in self.search_element_matches:
+            return
+        
+        # Use the main plot canvas on the right
+        self.plot_canvas.figure.clear()
+        ax = self.plot_canvas.figure.add_subplot(111)
+        
+        energy = self.search_spectrum_data['energy']
+        counts = self.search_spectrum_data['counts']
+        
+        # Plot original spectrum
+        ax.plot(energy, counts, 'b-', linewidth=0.8, alpha=0.5, label='Original')
+        
+        # Plot baseline-subtracted spectrum if available
+        if self.search_baseline_subtracted is not None:
+            ax.plot(energy, self.search_baseline_subtracted, 'g-', linewidth=0.8, alpha=0.7, label='Baseline Corrected')
+            plot_data = self.search_baseline_subtracted
+        else:
+            plot_data = counts
+        
+        # Get all lines for this element
+        all_lines = self.search_element_matches[element]['all_lines']
+        matched_lines = self.search_element_matches[element]['matched_lines']
+        matched_energies = {line['expected_energy'] for line in matched_lines}
+        
+        # Plot ALL characteristic lines for this element
+        for line in all_lines:
+            expected_e = line['Energy_keV']
+            rel_intensity = line['Relative_Intensity']
+            line_name = line['Line']
+            
+            # Check if this line was matched to a detected peak
+            is_matched = expected_e in matched_energies
+            
+            # Find the y-position for the line marker
+            energy_idx = np.argmin(np.abs(energy - expected_e))
+            if energy_idx < len(plot_data):
+                y_pos = plot_data[energy_idx]
+            else:
+                y_pos = np.max(plot_data) * 0.9
+            
+            if is_matched:
+                # Matched line - solid red with marker
+                ax.axvline(expected_e, color='red', linestyle='-', alpha=0.7, linewidth=2)
+                ax.plot(expected_e, y_pos, 'ro', markersize=10)
+                ax.annotate(f"{element} {line_name}\n{expected_e:.3f} keV\n✓ Detected", 
+                           xy=(expected_e, y_pos), xytext=(10, 10),
+                           textcoords='offset points', fontsize=7,
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+            else:
+                # Expected but not detected - dashed gray
+                ax.axvline(expected_e, color='gray', linestyle='--', alpha=0.4, linewidth=1)
+                # Only annotate strong lines that weren't detected
+                if rel_intensity >= 50:
+                    ax.annotate(f"{element} {line_name}\n{expected_e:.3f} keV\n(expected)", 
+                               xy=(expected_e, y_pos * 0.5), xytext=(5, -20),
+                               textcoords='offset points', fontsize=6,
+                               bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgray', alpha=0.6),
+                               alpha=0.7)
+        
+        # Add legend entries
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='red', linewidth=2, label='Detected Lines'),
+            Line2D([0], [0], color='gray', linestyle='--', linewidth=1, label='Expected Lines (not detected)')
+        ]
+        
+        ax.set_xlabel('Energy (keV)', fontsize=10)
+        ax.set_ylabel('Counts', fontsize=10)
+        ax.set_title(f'XRF Spectrum - All {element} Characteristic Lines', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(handles=legend_elements, loc='best', fontsize=8)
+        
+        self.plot_canvas.figure.tight_layout()
+        self.plot_canvas.draw()
+    
+    def setup_calibration_plots_tab(self, tab):
+        """Setup the calibration plots visualization tab - controls only, plots go to right pane"""
+        layout = QVBoxLayout(tab)
+        
+        # Info label
+        info_label = QLabel(
+            "📊 <b>Calibration Plots Viewer</b><br>"
+            "View calibration curves by element or standard. Plots will appear in the right pane."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("""
             QLabel {
                 background-color: #E3F2FD;
                 padding: 10px;
@@ -3325,12 +4472,63 @@ Calibrated Concentration: {concentration:.4f}
                 font-size: 11px;
             }
         """)
-        self.cal_info_label.setWordWrap(True)
-        layout.addWidget(self.cal_info_label)
+        layout.addWidget(info_label)
         
-        # Plot canvas
-        self.calibration_plot_canvas = PlotCanvas()
-        layout.addWidget(self.calibration_plot_canvas)
+        # View mode selector
+        mode_group = QGroupBox("View Mode")
+        mode_layout = QVBoxLayout(mode_group)
+        
+        self.cal_view_by_element_radio = QRadioButton("View by Element")
+        self.cal_view_by_standard_radio = QRadioButton("View by Standard")
+        self.cal_view_by_element_radio.setChecked(True)
+        self.cal_view_by_element_radio.toggled.connect(self.update_calibration_view_mode)
+        
+        mode_layout.addWidget(self.cal_view_by_element_radio)
+        mode_layout.addWidget(self.cal_view_by_standard_radio)
+        layout.addWidget(mode_group)
+        
+        # Elements list (for "View by Element" mode)
+        self.cal_elements_group = QGroupBox("Select Element")
+        elements_layout = QVBoxLayout(self.cal_elements_group)
+        
+        self.cal_element_list = QListWidget()
+        for symbol, data in ELEMENT_DEFINITIONS.items():
+            self.cal_element_list.addItem(f"{symbol} ({data['name']})")
+        self.cal_element_list.currentItemChanged.connect(self.on_calibration_element_selected)
+        elements_layout.addWidget(self.cal_element_list)
+        
+        layout.addWidget(self.cal_elements_group)
+        
+        # Standards list (for "View by Standard" mode)
+        self.cal_standards_group = QGroupBox("Select Standard")
+        standards_layout = QVBoxLayout(self.cal_standards_group)
+        
+        self.cal_standard_list = QListWidget()
+        for std_name in REFERENCE_MATERIALS.keys():
+            self.cal_standard_list.addItem(std_name)
+        self.cal_standard_list.currentItemChanged.connect(self.on_calibration_standard_selected)
+        standards_layout.addWidget(self.cal_standard_list)
+        
+        layout.addWidget(self.cal_standards_group)
+        self.cal_standards_group.hide()  # Hidden by default
+        
+        # Refresh button
+        refresh_btn = QPushButton("🔄 Refresh Plots")
+        refresh_btn.clicked.connect(self.refresh_calibration_plots)
+        layout.addWidget(refresh_btn)
+        
+        # Info display for selected calibration
+        self.cal_info_label = QLabel("Select an element or standard to view calibration details")
+        self.cal_info_label.setWordWrap(True)
+        self.cal_info_label.setStyleSheet("""
+            QLabel {
+                background-color: #E8F5E9;
+                padding: 8px;
+                border-radius: 5px;
+                font-size: 10px;
+            }
+        """)
+        layout.addWidget(self.cal_info_label)
         
         # Statistics table
         stats_group = QGroupBox("Calibration Statistics")
@@ -3342,25 +4540,61 @@ Calibrated Concentration: {concentration:.4f}
         stats_layout.addWidget(self.cal_stats_table)
         
         layout.addWidget(stats_group)
+        layout.addStretch()
     
     def update_calibration_plot(self):
-        """Update the calibration plot for the selected element"""
-        # Get selected element
-        element_text = self.cal_plot_element_combo.currentText()
-        element_symbol = element_text.split()[0]  # Extract symbol (e.g., "Pb" from "Pb (Lead)")
-        
+        """Legacy method - redirects to new refresh method"""
+        self.refresh_calibration_plots()
+    
+    def update_calibration_view_mode(self):
+        """Switch between viewing by element or by standard"""
+        if self.cal_view_by_element_radio.isChecked():
+            self.cal_elements_group.show()
+            self.cal_standards_group.hide()
+            # Trigger element view if one is selected
+            if self.cal_element_list.currentItem():
+                self.on_calibration_element_selected(self.cal_element_list.currentItem(), None)
+        else:
+            self.cal_elements_group.hide()
+            self.cal_standards_group.show()
+            # Trigger standard view if one is selected
+            if self.cal_standard_list.currentItem():
+                self.on_calibration_standard_selected(self.cal_standard_list.currentItem(), None)
+    
+    def on_calibration_element_selected(self, current, previous):
+        """Handle element selection in calibration plots tab"""
+        if current:
+            element_text = current.text()
+            element_symbol = element_text.split()[0]
+            self.display_single_element_calibration(element_symbol)
+    
+    def on_calibration_standard_selected(self, current, previous):
+        """Handle standard selection in calibration plots tab"""
+        if current:
+            standard_name = current.text()
+            self.display_standard_all_elements(standard_name)
+    
+    def refresh_calibration_plots(self):
+        """Refresh the current calibration plot view"""
+        if self.cal_view_by_element_radio.isChecked():
+            if self.cal_element_list.currentItem():
+                self.on_calibration_element_selected(self.cal_element_list.currentItem(), None)
+        else:
+            if self.cal_standard_list.currentItem():
+                self.on_calibration_standard_selected(self.cal_standard_list.currentItem(), None)
+    
+    def display_single_element_calibration(self, element_symbol):
+        """Display calibration plot for a single element (original behavior)"""
         # Check if calibration exists
         if not hasattr(self.calibration_manager, 'calibrations'):
-            self.cal_info_label.setText("⚠️ No calibrations loaded. Create calibrations in the Calibrations tab first.")
-            self.calibration_plot_canvas.figure.clear()
-            self.calibration_plot_canvas.draw()
+            self.plot_canvas.figure.clear()
+            self.plot_canvas.draw()
             self.cal_stats_table.setRowCount(0)
             return
         
         if element_symbol not in self.calibration_manager.calibrations:
-            self.cal_info_label.setText(f"⚠️ No calibration found for {element_symbol}. Create a calibration in the Calibrations tab.")
-            self.calibration_plot_canvas.figure.clear()
-            self.calibration_plot_canvas.draw()
+            self.plot_canvas.figure.clear()
+            self.plot_canvas.draw()
             self.cal_stats_table.setRowCount(0)
             return
         
@@ -3372,10 +4606,8 @@ Calibrated Concentration: {concentration:.4f}
         standards_used = cal_data.get('standards_used', [])
         timestamp = cal_data.get('timestamp', 'Unknown')
         
-        # Update info label with diagnostic information
+        # Update info label
         element_name = ELEMENT_DEFINITIONS[element_symbol]['name']
-        
-        # Analyze R² quality
         r2_warning = ""
         if r_squared < 0.5:
             r2_warning = " ❌ POOR CALIBRATION - R² too low!"
@@ -3384,7 +4616,6 @@ Calibrated Concentration: {concentration:.4f}
         elif r_squared < 0.95:
             r2_warning = " ⚠️ Acceptable but could be improved"
         
-        # Analyze intercept
         intercept_note = ""
         if intercept < 0:
             intercept_note = " (Negative intercept: background slightly overcorrected - normal)"
@@ -3398,36 +4629,105 @@ Calibrated Concentration: {concentration:.4f}
             f"Created: {timestamp}"
         )
         
-        # Change background color based on R² quality
+        # Set background color based on R² quality
         if r_squared < 0.5:
-            self.cal_info_label.setStyleSheet("""
-                QLabel {
-                    background-color: #FFCCCC;
-                    padding: 10px;
-                    border-radius: 5px;
-                    font-size: 11px;
-                    border: 2px solid red;
-                }
-            """)
+            bg_color = "#FFCCCC"
+            border = "2px solid red"
         elif r_squared < 0.90:
-            self.cal_info_label.setStyleSheet("""
-                QLabel {
-                    background-color: #FFF4CC;
-                    padding: 10px;
-                    border-radius: 5px;
-                    font-size: 11px;
-                    border: 2px solid orange;
-                }
-            """)
+            bg_color = "#FFF4CC"
+            border = "2px solid orange"
         else:
-            self.cal_info_label.setStyleSheet("""
-                QLabel {
-                    background-color: #E3F2FD;
-                    padding: 10px;
-                    border-radius: 5px;
-                    font-size: 11px;
-                }
-            """)
+            bg_color = "#E3F2FD"
+            border = "none"
+        
+        self.cal_info_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg_color};
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 11px;
+                border: {border};
+            }}
+        """)
+        
+        # Plot the calibration curve (reuse existing plotting logic)
+        self._plot_element_calibration_curve(element_symbol, cal_data)
+    
+    def display_standard_all_elements(self, standard_name):
+        """Display all calibrated element plots for a selected standard"""
+        # Check if calibrations exist
+        if not hasattr(self.calibration_manager, 'calibrations'):
+            self.plot_canvas.figure.clear()
+            self.plot_canvas.draw()
+            self.cal_stats_table.setRowCount(0)
+            return
+        
+        # Find which elements have calibrations that use this standard
+        elements_with_standard = []
+        for element_symbol, cal_data in self.calibration_manager.calibrations.items():
+            standards_used = cal_data.get('standards_used', [])
+            if standard_name in standards_used:
+                elements_with_standard.append(element_symbol)
+        
+        if not elements_with_standard:
+            self.plot_canvas.figure.clear()
+            self.plot_canvas.draw()
+            self.cal_stats_table.setRowCount(0)
+            return
+        
+        # Update info label
+        self.cal_info_label.setText(
+            f"📊 Standard: {standard_name}\n"
+            f"Showing calibration curves for {len(elements_with_standard)} element(s): {', '.join(elements_with_standard)}"
+        )
+        self.cal_info_label.setStyleSheet("""
+            QLabel {
+                background-color: #E3F2FD;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 11px;
+            }
+        """)
+        
+        # Create subplot grid
+        self.plot_canvas.figure.clear()
+        n_plots = len(elements_with_standard)
+        
+        # Determine grid layout
+        if n_plots == 1:
+            rows, cols = 1, 1
+        elif n_plots == 2:
+            rows, cols = 1, 2
+        elif n_plots <= 4:
+            rows, cols = 2, 2
+        elif n_plots <= 6:
+            rows, cols = 2, 3
+        elif n_plots <= 9:
+            rows, cols = 3, 3
+        else:
+            rows, cols = 4, 3
+        
+        # Plot each element
+        stats_data = []
+        for idx, element_symbol in enumerate(sorted(elements_with_standard)):
+            ax = self.plot_canvas.figure.add_subplot(rows, cols, idx + 1)
+            cal_data = self.calibration_manager.calibrations[element_symbol]
+            
+            # Plot this element's calibration with the standard highlighted
+            self._plot_element_in_subplot(ax, element_symbol, cal_data, standard_name, stats_data)
+        
+        self.plot_canvas.figure.tight_layout()
+        self.plot_canvas.draw()
+        
+        # Update statistics table with data from all elements
+        self._update_stats_table_multi_element(stats_data)
+    
+    def _plot_element_calibration_curve(self, element_symbol, cal_data):
+        """Helper method to plot a single element's calibration curve"""
+        slope = cal_data.get('slope', 0)
+        intercept = cal_data.get('intercept', 0)
+        r_squared = cal_data.get('r_squared', 0)
+        standards_used = cal_data.get('standards_used', [])
         
         # Collect standard data points
         standard_intensities = []
@@ -3435,98 +4735,39 @@ Calibrated Concentration: {concentration:.4f}
         standard_names = []
         
         for std_name in standards_used:
-            # Try to get the certified concentration
-            if std_name in REFERENCE_MATERIALS:
-                cert_value = REFERENCE_MATERIALS[std_name].get(element_symbol)
-                if cert_value and cert_value != "N/A":
-                    try:
-                        if isinstance(cert_value, str):
-                            if '%' in cert_value:
-                                if '<' in cert_value:
-                                    continue
-                                cert_conc = float(cert_value.replace('%', '')) * 10000
-                            else:
-                                cert_conc = float(cert_value)
-                        else:
-                            cert_conc = float(cert_value)
-                        
-                        # Calculate intensity from calibration equation
-                        # Concentration = slope * Intensity + intercept
-                        # Intensity = (Concentration - intercept) / slope
-                        if slope != 0:
-                            intensity = (cert_conc - intercept) / slope
-                            standard_intensities.append(intensity)
-                            standard_concentrations.append(cert_conc)
-                            standard_names.append(std_name)
-                    except (ValueError, TypeError):
-                        continue
-            elif hasattr(self, 'custom_standards_data') and std_name in self.custom_standards_data:
-                # Custom standard
-                if element_symbol in self.custom_standards_data[std_name]:
-                    cert_conc = self.custom_standards_data[std_name][element_symbol]
-                    if slope != 0:
-                        intensity = (cert_conc - intercept) / slope
-                        standard_intensities.append(intensity)
-                        standard_concentrations.append(cert_conc)
-                        standard_names.append(std_name)
+            cert_conc = self._get_certified_concentration(std_name, element_symbol)
+            if cert_conc is not None and slope != 0:
+                intensity = (cert_conc - intercept) / slope
+                standard_intensities.append(intensity)
+                standard_concentrations.append(cert_conc)
+                standard_names.append(std_name)
         
         # Create the plot
-        self.calibration_plot_canvas.figure.clear()
-        ax = self.calibration_plot_canvas.figure.add_subplot(111)
+        self.plot_canvas.figure.clear()
+        ax = self.plot_canvas.figure.add_subplot(111)
         
         if standard_intensities:
-            # Get raw individual measurements if available
             raw_intensities_dict = cal_data.get('raw_intensities', {})
             
-            # Define color palette for standards (colorblind-friendly)
-            standard_colors = [
-                '#1f77b4',  # Blue
-                '#ff7f0e',  # Orange
-                '#2ca02c',  # Green
-                '#d62728',  # Red
-                '#9467bd',  # Purple
-                '#8c564b',  # Brown
-                '#e377c2',  # Pink
-                '#7f7f7f',  # Gray
-                '#bcbd22',  # Olive
-                '#17becf'   # Cyan
-            ]
+            # Color palette
+            standard_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                             '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
             
-            # Plot individual measurements first (smaller points, color-coded by standard)
+            # Plot individual measurements
             if raw_intensities_dict:
                 for idx, std_name in enumerate(standards_used):
                     if std_name in raw_intensities_dict and raw_intensities_dict[std_name]:
-                        # Get certified concentration for this standard
-                        cert_conc = None
-                        if std_name in REFERENCE_MATERIALS:
-                            cert_value = REFERENCE_MATERIALS[std_name].get(element_symbol)
-                            if cert_value and cert_value != "N/A":
-                                try:
-                                    if isinstance(cert_value, str):
-                                        if '%' in cert_value and '<' not in cert_value:
-                                            cert_conc = float(cert_value.replace('%', '')) * 10000
-                                        elif '<' not in cert_value:
-                                            cert_conc = float(cert_value)
-                                    else:
-                                        cert_conc = float(cert_value)
-                                except:
-                                    pass
-                        elif hasattr(self, 'custom_standards_data') and std_name in self.custom_standards_data:
-                            if element_symbol in self.custom_standards_data[std_name]:
-                                cert_conc = self.custom_standards_data[std_name][element_symbol]
-                        
+                        cert_conc = self._get_certified_concentration(std_name, element_symbol)
                         if cert_conc is not None:
                             raw_ints = raw_intensities_dict[std_name]
                             raw_concs = [cert_conc] * len(raw_ints)
                             color = standard_colors[idx % len(standard_colors)]
-                            ax.scatter(raw_ints, raw_concs, 
-                                     color=color, s=40, alpha=0.6, zorder=3, 
-                                     label=f'{std_name} (n={len(raw_ints)})')
+                            ax.scatter(raw_ints, raw_concs, color=color, s=40, alpha=0.6, 
+                                     zorder=3, label=f'{std_name} (n={len(raw_ints)})')
             
             # Plot calibration line
             max_intensity = max(standard_intensities) * 1.2
             if raw_intensities_dict:
-                # Include raw measurements in max calculation
                 all_raw = [val for vals in raw_intensities_dict.values() for val in vals]
                 if all_raw:
                     max_intensity = max(max_intensity, max(all_raw) * 1.2)
@@ -3537,21 +4778,20 @@ Calibrated Concentration: {concentration:.4f}
             ax.plot(intensity_range, concentration_range, 'k-', linewidth=2.5, 
                    label=f'Calibration: y = {slope:.4f}x + {intercept:.2f}', zorder=4)
             
-            # Plot averaged standard points (larger, with matching colors but darker/outlined)
+            # Plot averaged standard points
             for idx, (intensity, conc, name) in enumerate(zip(standard_intensities, standard_concentrations, standard_names)):
                 color = standard_colors[idx % len(standard_colors)]
-                ax.scatter([intensity], [conc], 
-                          color=color, s=150, alpha=0.9, zorder=5, 
-                          edgecolors='black', linewidths=2.5,
-                          marker='o')
+                ax.scatter([intensity], [conc], color=color, s=150, alpha=0.9, zorder=5, 
+                          edgecolors='black', linewidths=2.5, marker='o')
             
-            # Add labels for each standard
+            # Add labels
             for i, name in enumerate(standard_names):
                 ax.annotate(name, (standard_intensities[i], standard_concentrations[i]),
                            xytext=(5, 5), textcoords='offset points', fontsize=9, fontweight='bold',
                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='gray'))
             
-            # Labels and formatting
+            # Formatting
+            element_name = ELEMENT_DEFINITIONS[element_symbol]['name']
             ax.set_xlabel('Integrated Intensity (cps)', fontsize=10)
             ax.set_ylabel(f'{element_symbol} Concentration (ppm)', fontsize=10)
             ax.set_title(f'{element_name} ({element_symbol}) Calibration Curve\nR² = {r_squared:.6f}', 
@@ -3564,32 +4804,27 @@ Calibrated Concentration: {concentration:.4f}
             # Update statistics table
             self.cal_stats_table.setRowCount(len(standard_names))
             for i, name in enumerate(standard_names):
-                # Standard name
                 self.cal_stats_table.setItem(i, 0, QTableWidgetItem(name))
                 
-                # Certified concentration
                 cert_item = QTableWidgetItem(f"{standard_concentrations[i]:.1f}")
                 cert_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.cal_stats_table.setItem(i, 1, cert_item)
                 
-                # Measured intensity
                 intensity_item = QTableWidgetItem(f"{standard_intensities[i]:.1f}")
                 intensity_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.cal_stats_table.setItem(i, 2, intensity_item)
                 
-                # Predicted concentration (should match certified)
                 predicted = slope * standard_intensities[i] + intercept
                 pred_item = QTableWidgetItem(f"{predicted:.1f}")
                 pred_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 
-                # Color code based on accuracy
                 error_pct = abs((predicted - standard_concentrations[i]) / standard_concentrations[i] * 100)
                 if error_pct < 2:
-                    pred_item.setBackground(QColor(144, 238, 144))  # Light green
+                    pred_item.setBackground(QColor(144, 238, 144))
                 elif error_pct < 5:
-                    pred_item.setBackground(QColor(255, 255, 200))  # Light yellow
+                    pred_item.setBackground(QColor(255, 255, 200))
                 else:
-                    pred_item.setBackground(QColor(255, 200, 200))  # Light red
+                    pred_item.setBackground(QColor(255, 200, 200))
                 
                 self.cal_stats_table.setItem(i, 3, pred_item)
             
@@ -3598,8 +4833,151 @@ Calibrated Concentration: {concentration:.4f}
             ax.text(0.5, 0.5, 'No standard data available', 
                    ha='center', va='center', transform=ax.transAxes, fontsize=14)
         
-        self.calibration_plot_canvas.figure.tight_layout()
-        self.calibration_plot_canvas.draw()
+        self.plot_canvas.figure.tight_layout()
+        self.plot_canvas.draw()
+    
+    def _plot_element_in_subplot(self, ax, element_symbol, cal_data, highlight_standard, stats_data):
+        """Helper method to plot an element's calibration in a subplot"""
+        slope = cal_data.get('slope', 0)
+        intercept = cal_data.get('intercept', 0)
+        r_squared = cal_data.get('r_squared', 0)
+        standards_used = cal_data.get('standards_used', [])
+        raw_intensities_dict = cal_data.get('raw_intensities', {})
+        
+        # Collect standard data
+        standard_intensities = []
+        standard_concentrations = []
+        standard_names = []
+        
+        for std_name in standards_used:
+            cert_conc = self._get_certified_concentration(std_name, element_symbol)
+            if cert_conc is not None and slope != 0:
+                intensity = (cert_conc - intercept) / slope
+                standard_intensities.append(intensity)
+                standard_concentrations.append(cert_conc)
+                standard_names.append(std_name)
+        
+        if not standard_intensities:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{element_symbol}', fontsize=10)
+            return
+        
+        # Plot individual measurements (smaller, semi-transparent)
+        if raw_intensities_dict:
+            for std_name in standards_used:
+                if std_name in raw_intensities_dict and raw_intensities_dict[std_name]:
+                    cert_conc = self._get_certified_concentration(std_name, element_symbol)
+                    if cert_conc is not None:
+                        raw_ints = raw_intensities_dict[std_name]
+                        raw_concs = [cert_conc] * len(raw_ints)
+                        # Highlight the selected standard
+                        if std_name == highlight_standard:
+                            ax.scatter(raw_ints, raw_concs, color='red', s=60, alpha=0.8, 
+                                     zorder=4, marker='o', edgecolors='darkred', linewidths=1.5)
+                        else:
+                            ax.scatter(raw_ints, raw_concs, color='gray', s=30, alpha=0.4, zorder=2)
+        
+        # Plot calibration line
+        max_intensity = max(standard_intensities) * 1.2
+        if raw_intensities_dict:
+            all_raw = [val for vals in raw_intensities_dict.values() for val in vals]
+            if all_raw:
+                max_intensity = max(max_intensity, max(all_raw) * 1.2)
+        
+        intensity_range = np.linspace(0, max_intensity, 100)
+        concentration_range = slope * intensity_range + intercept
+        ax.plot(intensity_range, concentration_range, 'k-', linewidth=1.5, alpha=0.7, zorder=3)
+        
+        # Plot averaged standard points
+        for intensity, conc, name in zip(standard_intensities, standard_concentrations, standard_names):
+            if name == highlight_standard:
+                ax.scatter([intensity], [conc], color='red', s=120, alpha=1.0, zorder=5, 
+                          edgecolors='darkred', linewidths=2, marker='o')
+                # Add label for highlighted standard
+                ax.annotate(name, (intensity, conc), xytext=(5, 5), textcoords='offset points',
+                           fontsize=8, fontweight='bold', color='darkred')
+                
+                # Add to stats data
+                predicted = slope * intensity + intercept
+                stats_data.append({
+                    'element': element_symbol,
+                    'standard': name,
+                    'certified': conc,
+                    'intensity': intensity,
+                    'predicted': predicted
+                })
+            else:
+                ax.scatter([intensity], [conc], color='gray', s=60, alpha=0.5, zorder=3, 
+                          edgecolors='black', linewidths=1)
+        
+        # Formatting
+        element_name = ELEMENT_DEFINITIONS[element_symbol]['name']
+        ax.set_xlabel('Intensity (cps)', fontsize=8)
+        ax.set_ylabel('Conc. (ppm)', fontsize=8)
+        ax.set_title(f'{element_symbol} - R²={r_squared:.3f}', fontsize=9, fontweight='bold')
+        ax.grid(True, alpha=0.2)
+        ax.set_xlim(0, max_intensity)
+        ax.set_ylim(0, max(standard_concentrations) * 1.2)
+        ax.tick_params(labelsize=7)
+    
+    def _get_certified_concentration(self, std_name, element_symbol):
+        """Helper method to get certified concentration for a standard and element"""
+        if std_name in REFERENCE_MATERIALS:
+            cert_value = REFERENCE_MATERIALS[std_name].get(element_symbol)
+            if cert_value and cert_value != "N/A":
+                try:
+                    if isinstance(cert_value, str):
+                        if '%' in cert_value:
+                            if '<' in cert_value:
+                                return None
+                            return float(cert_value.replace('%', '')) * 10000
+                        elif '<' in cert_value:
+                            return None
+                        else:
+                            return float(cert_value)
+                    else:
+                        return float(cert_value)
+                except (ValueError, TypeError):
+                    return None
+        elif hasattr(self, 'custom_standards_data') and std_name in self.custom_standards_data:
+            if element_symbol in self.custom_standards_data[std_name]:
+                return self.custom_standards_data[std_name][element_symbol]
+        return None
+    
+    def _update_stats_table_multi_element(self, stats_data):
+        """Update statistics table for multi-element view"""
+        self.cal_stats_table.setRowCount(len(stats_data))
+        
+        for i, data in enumerate(stats_data):
+            # Element + Standard name
+            self.cal_stats_table.setItem(i, 0, QTableWidgetItem(f"{data['element']} - {data['standard']}"))
+            
+            # Certified concentration
+            cert_item = QTableWidgetItem(f"{data['certified']:.1f}")
+            cert_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.cal_stats_table.setItem(i, 1, cert_item)
+            
+            # Measured intensity
+            intensity_item = QTableWidgetItem(f"{data['intensity']:.1f}")
+            intensity_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.cal_stats_table.setItem(i, 2, intensity_item)
+            
+            # Predicted concentration
+            pred_item = QTableWidgetItem(f"{data['predicted']:.1f}")
+            pred_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            # Color code based on accuracy
+            error_pct = abs((data['predicted'] - data['certified']) / data['certified'] * 100)
+            if error_pct < 2:
+                pred_item.setBackground(QColor(144, 238, 144))
+            elif error_pct < 5:
+                pred_item.setBackground(QColor(255, 255, 200))
+            else:
+                pred_item.setBackground(QColor(255, 200, 200))
+            
+            self.cal_stats_table.setItem(i, 3, pred_item)
+        
+        self.cal_stats_table.resizeColumnsToContents()
     
     def update_fitting_parameters_for_element(self, element_symbol):
         """Update the fitting parameters in the main UI for the selected element"""
@@ -3881,7 +5259,7 @@ Calibrated Concentration: {concentration:.4f}
         """Show dialog for automatic calibration from spectra files"""
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Auto-Calibrate {element} from Spectra Files")
-        dialog.setGeometry(300, 200, 800, 600)
+        dialog.setGeometry(300, 200, 900, 650)
         
         layout = QVBoxLayout(dialog)
         
@@ -3891,38 +5269,50 @@ Calibrated Concentration: {concentration:.4f}
                            f"1. Load XRF spectra files for each reference material\n"
                            f"2. Automatically fit peaks and calculate integrated intensities\n"
                            f"3. Create a calibration curve using the certified concentrations\n\n"
-                           f"Select spectra files for each available standard:")
+                           f"Check the standards you want to use and select their spectra files:")
         info_label.setWordWrap(True)
         info_label.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         layout.addWidget(info_label)
         
-        # File selection table
-        file_table = QTableWidget(len(standards), 4)
-        file_table.setHorizontalHeaderLabels(['Standard', 'Certified Conc. (ppm)', 'Spectra File', 'Status'])
+        # File selection table with checkboxes
+        file_table = QTableWidget(len(standards), 5)
+        file_table.setHorizontalHeaderLabels(['Use', 'Standard', 'Certified Conc. (ppm)', 'Spectra File', 'Status'])
         
         file_buttons = []
         file_paths = {}
         status_labels = []
+        standard_checkboxes = []
         
         for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+            # Checkbox for selection
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)  # Default to checked
+            checkbox_widget = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_widget)
+            checkbox_layout.addWidget(checkbox)
+            checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            file_table.setCellWidget(i, 0, checkbox_widget)
+            standard_checkboxes.append(checkbox)
+            
             # Standard name
-            file_table.setItem(i, 0, QTableWidgetItem(standard))
-            file_table.item(i, 0).setFlags(file_table.item(i, 0).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            file_table.setItem(i, 1, QTableWidgetItem(standard))
+            file_table.item(i, 1).setFlags(file_table.item(i, 1).flags() & ~Qt.ItemFlag.ItemIsEditable)
             
             # Certified concentration
-            file_table.setItem(i, 1, QTableWidgetItem(f"{conc:.2f}"))
-            file_table.item(i, 1).setFlags(file_table.item(i, 1).flags() & ~Qt.ItemFlag.ItemIsEditable)
+            file_table.setItem(i, 2, QTableWidgetItem(f"{conc:.2f}"))
+            file_table.item(i, 2).setFlags(file_table.item(i, 2).flags() & ~Qt.ItemFlag.ItemIsEditable)
             
             # File selection button
             file_btn = QPushButton(f"Select {standard} File...")
             file_btn.clicked.connect(lambda checked, std=standard: self.select_standard_file(std, file_paths, status_labels, standards))
-            file_table.setCellWidget(i, 2, file_btn)
+            file_table.setCellWidget(i, 3, file_btn)
             file_buttons.append(file_btn)
             
             # Status
             status_item = QTableWidgetItem("No file selected")
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            file_table.setItem(i, 3, status_item)
+            file_table.setItem(i, 4, status_item)
             status_labels.append(status_item)
         
         file_table.resizeColumnsToContents()
@@ -3942,8 +5332,8 @@ Calibrated Concentration: {concentration:.4f}
         # Buttons
         button_layout = QHBoxLayout()
         
-        analyze_btn = QPushButton("🔬 Analyze All Spectra & Create Calibration")
-        analyze_btn.clicked.connect(lambda: self.analyze_all_standards(element, standards, concentrations, file_paths, dialog))
+        analyze_btn = QPushButton("🔬 Analyze Selected Spectra & Create Calibration")
+        analyze_btn.clicked.connect(lambda: self.analyze_all_standards(element, standards, concentrations, file_paths, standard_checkboxes, dialog))
         analyze_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -3968,6 +5358,7 @@ Calibrated Concentration: {concentration:.4f}
         dialog.file_paths = file_paths
         dialog.status_labels = status_labels
         dialog.standards = standards
+        dialog.standard_checkboxes = standard_checkboxes
         
         dialog.exec()
     
@@ -3985,17 +5376,32 @@ Calibrated Concentration: {concentration:.4f}
             status_labels[standard_index].setText(f"✓ {os.path.basename(file_path)}")
             status_labels[standard_index].setBackground(QColor(144, 238, 144))  # Light green
     
-    def analyze_all_standards(self, element, standards, concentrations, file_paths, dialog):
+    def analyze_all_standards(self, element, standards, concentrations, file_paths, standard_checkboxes, dialog):
         """Analyze all selected spectra files and create calibration"""
         self.calibration_progress.clear()
         self.calibration_progress.append(f"Starting automatic calibration for {element}...\n")
         
-        # Check that all files are selected
-        missing_files = [std for std in standards if std not in file_paths]
+        # Filter to only checked standards
+        selected_standards = []
+        selected_concentrations = []
+        for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+            if standard_checkboxes[i].isChecked():
+                selected_standards.append(standard)
+                selected_concentrations.append(conc)
+        
+        if len(selected_standards) < 2:
+            QMessageBox.warning(dialog, "Insufficient Standards", 
+                              "Please select at least 2 standards for calibration.")
+            return
+        
+        # Check that all selected standards have files
+        missing_files = [std for std in selected_standards if std not in file_paths]
         if missing_files:
             QMessageBox.warning(dialog, "Missing Files", 
                               f"Please select spectra files for: {', '.join(missing_files)}")
             return
+        
+        self.calibration_progress.append(f"Using {len(selected_standards)} selected standards\n")
         
         # Create a temporary peak fitter for this element
         temp_fitter = XRFPeakFitter(element=element)
@@ -4004,7 +5410,7 @@ Calibrated Concentration: {concentration:.4f}
         valid_concentrations = []
         valid_standards = []
         
-        for i, (standard, conc) in enumerate(zip(standards, concentrations)):
+        for i, (standard, conc) in enumerate(zip(selected_standards, selected_concentrations)):
             if standard not in file_paths:
                 continue
                 
@@ -4060,7 +5466,9 @@ Calibrated Concentration: {concentration:.4f}
                          f"Equation: Concentration = {slope:.4f} × Intensity + {intercept:.4f}\n"
                          f"R² = {r_value**2:.4f}\n"
                          f"Standard Error = {std_err:.4f}\n"
-                         f"Standards analyzed: {len(valid_standards)}/{len(standards)}\n\n"
+                         f"Standards selected: {len(selected_standards)}\n"
+                         f"Successfully analyzed: {len(valid_standards)}\n"
+                         f"Standards used: {', '.join(valid_standards)}\n\n"
                          f"Apply this calibration?")
             
             reply = QMessageBox.question(dialog, "Calibration Results", result_msg,
@@ -4071,10 +5479,9 @@ Calibrated Concentration: {concentration:.4f}
                 self.peak_fitter.update_element_calibration(element, slope, intercept)
                 self.fitter.update_element_calibration(element, slope, intercept)
                 
-                # Save calibration persistently
-                standards_used = [standards[i] for i in range(len(standards)) if i < len(measured_intensities)]
+                # Save calibration persistently with the standards that were actually used
                 self.calibration_manager.update_calibration(
-                    element, slope, intercept, r_value**2, standards_used
+                    element, slope, intercept, r_value**2, valid_standards
                 )
                 
                 # Update UI
@@ -4375,16 +5782,29 @@ Calibrated Concentration: {concentration:.4f}
         
         # Show interference warning if needed
         if interference_warnings:
+            # Check if Pb-As is among the interferences
+            has_pb_as = any((elem1 == 'Pb' and elem2 == 'As') or (elem1 == 'As' and elem2 == 'Pb') 
+                           for elem1, elem2, _ in interference_warnings)
+            
             warning_msg = "⚠️ PEAK INTERFERENCE DETECTED ⚠️\n\n"
             warning_msg += "The following elements have overlapping emission lines:\n\n"
             for elem1, elem2, note in interference_warnings:
                 warning_msg += f"• {elem1} ↔ {elem2}\n  {note}\n\n"
+            
+            if has_pb_as:
+                warning_msg += "✨ SOLUTION AVAILABLE FOR Pb-As:\n"
+                warning_msg += "Use the '⚛️ Pb-As Deconvolution' button in the Quant tab\n"
+                warning_msg += "for accurate simultaneous quantification of both elements.\n\n"
+            
             warning_msg += "Recommendations:\n"
             warning_msg += "1. Calibrate elements separately if possible\n"
             warning_msg += "2. Use standards with only ONE of these elements present\n"
             warning_msg += "3. Consider using alternative peaks (L-beta, K-beta)\n"
-            warning_msg += "4. Apply interference correction (advanced)\n\n"
-            warning_msg += "Continue with calibration anyway?"
+            if has_pb_as:
+                warning_msg += "4. For Pb+As samples: Use Pb-As Deconvolution (recommended)\n"
+            else:
+                warning_msg += "4. Apply interference correction (advanced)\n"
+            warning_msg += "\nContinue with calibration anyway?"
             
             reply = QMessageBox.question(self, "Peak Interference Warning", warning_msg,
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -4520,16 +5940,46 @@ Calibrated Concentration: {concentration:.4f}
         summary_layout.addWidget(element_table)
         layout.addWidget(summary_group)
         
-        # Progress area
-        progress_group = QGroupBox("Calibration Progress")
-        progress_layout = QVBoxLayout(progress_group)
+        # Create tabbed view for progress and visualizations
+        tabs = QTabWidget()
+        
+        # Progress tab
+        progress_tab = QWidget()
+        progress_layout = QVBoxLayout(progress_tab)
         
         self.multi_calibration_progress = QTextEdit()
-        self.multi_calibration_progress.setMaximumHeight(200)
         self.multi_calibration_progress.setReadOnly(True)
         progress_layout.addWidget(self.multi_calibration_progress)
         
-        layout.addWidget(progress_group)
+        tabs.addTab(progress_tab, "📊 Progress")
+        
+        # Peak Fits tab
+        fits_tab = QWidget()
+        fits_layout = QVBoxLayout(fits_tab)
+        
+        fits_info = QLabel("Peak fitting visualizations will appear here during calibration")
+        fits_info.setStyleSheet("color: gray; font-style: italic;")
+        fits_layout.addWidget(fits_info)
+        
+        self.multi_cal_fits_canvas = PlotCanvas()
+        fits_layout.addWidget(self.multi_cal_fits_canvas)
+        
+        tabs.addTab(fits_tab, "🔬 Peak Fits")
+        
+        # Calibration Curves tab
+        curves_tab = QWidget()
+        curves_layout = QVBoxLayout(curves_tab)
+        
+        curves_info = QLabel("Calibration curves will appear here after analysis")
+        curves_info.setStyleSheet("color: gray; font-style: italic;")
+        curves_layout.addWidget(curves_info)
+        
+        self.multi_cal_curves_canvas = PlotCanvas()
+        curves_layout.addWidget(self.multi_cal_curves_canvas)
+        
+        tabs.addTab(curves_tab, "📈 Calibration Curves")
+        
+        layout.addWidget(tabs)
         
         # Buttons
         button_layout = QHBoxLayout()
@@ -4785,7 +6235,8 @@ Calibrated Concentration: {concentration:.4f}
                 'standards': [],  # Standard names
                 'fit_quality': [],  # RSD values
                 'raw_intensities': {},  # Individual measurements: {standard_name: [intensity1, intensity2, ...]}
-                'raw_standards': []  # List of standard names for each raw measurement
+                'raw_standards': [],  # List of standard names for each raw measurement
+                'example_fit': None  # Store one example fit for visualization
             }
         
         # Analyze each standard's files for all elements (only selected materials)
@@ -4870,6 +6321,12 @@ Calibrated Concentration: {concentration:.4f}
                             # Store intensity for this file
                             if element not in material_element_intensities:
                                 material_element_intensities[element] = {'intensities': [], 'cert_conc': cert_conc}
+                                # Store first fit for visualization
+                                material_element_intensities[element]['first_fit'] = {
+                                    'x': x, 'y': y, 'x_fit': x_fit, 'fit_curve': fit_curve,
+                                    'fit_params': fit_params, 'r_squared': r_squared,
+                                    'material': material, 'file_idx': file_idx
+                                }
                             material_element_intensities[element]['intensities'].append(integrated_intensity)
                             
                         except Exception as e:
@@ -4894,6 +6351,10 @@ Calibrated Concentration: {concentration:.4f}
                     element_results[element]['concentrations'].append(cert_conc)
                     element_results[element]['standards'].append(material)
                     element_results[element]['fit_quality'].append(rsd)  # Store RSD as quality metric
+                    
+                    # Store first example fit if not already stored
+                    if element_results[element]['example_fit'] is None and 'first_fit' in material_element_intensities[element]:
+                        element_results[element]['example_fit'] = material_element_intensities[element]['first_fit']
                     
                     # Store raw individual measurements for plotting
                     if material not in element_results[element]['raw_intensities']:
@@ -4979,6 +6440,11 @@ Calibrated Concentration: {concentration:.4f}
         if failed_calibrations:
             self.multi_calibration_progress.append(f"Failed calibrations: {', '.join(failed_calibrations)}")
         
+        # Plot peak fits and calibration curves for successful calibrations
+        if successful_calibrations:
+            self.plot_multi_element_peak_fits(element_results, successful_calibrations)
+            self.plot_multi_element_calibration_curves(element_results, successful_calibrations)
+        
         # Show summary dialog
         if successful_calibrations:
             summary_msg = (f"Multi-Element Calibration Results:\n\n"
@@ -5009,6 +6475,596 @@ Calibrated Concentration: {concentration:.4f}
             QMessageBox.warning(dialog, "Calibration Failed", 
                               "No elements could be successfully calibrated.\n"
                               "Please check your spectra files and try again.")
+    
+    def plot_multi_element_peak_fits(self, element_results, successful_elements):
+        """Plot example peak fits for all successfully calibrated elements"""
+        try:
+            # Determine grid layout based on number of elements
+            n_elements = len(successful_elements)
+            if n_elements == 1:
+                rows, cols = 1, 1
+            elif n_elements == 2:
+                rows, cols = 1, 2
+            elif n_elements <= 4:
+                rows, cols = 2, 2
+            elif n_elements <= 6:
+                rows, cols = 2, 3
+            elif n_elements <= 9:
+                rows, cols = 3, 3
+            else:
+                rows, cols = 4, 3
+            
+            # Clear and setup figure
+            self.multi_cal_fits_canvas.figure.clear()
+            
+            # Create subplots
+            for idx, element in enumerate(successful_elements):
+                if idx >= rows * cols:
+                    break  # Don't plot more than grid allows
+                
+                example_fit = element_results[element].get('example_fit')
+                if example_fit is None:
+                    continue
+                
+                ax = self.multi_cal_fits_canvas.figure.add_subplot(rows, cols, idx + 1)
+                
+                # Extract fit data
+                x = example_fit['x']
+                y = example_fit['y']
+                x_fit = example_fit['x_fit']
+                fit_curve = example_fit['fit_curve']
+                fit_params = example_fit['fit_params']
+                r_squared = example_fit['r_squared']
+                material = example_fit['material']
+                
+                # Calculate background
+                background_y = fit_params['background_slope'] * x_fit + fit_params['background_intercept']
+                
+                # Plot spectrum
+                ax.plot(x, y, 'b-', linewidth=0.8, alpha=0.5, label='Spectrum')
+                
+                # Plot fit
+                ax.plot(x_fit, fit_curve, 'r-', linewidth=2, label='Fit')
+                
+                # Plot background
+                ax.plot(x_fit, background_y, 'g--', linewidth=1, alpha=0.7, label='Background')
+                
+                # Labels and title
+                ax.set_xlabel('Energy (keV)', fontsize=8)
+                ax.set_ylabel('Counts', fontsize=8)
+                ax.set_title(f'{element} - {material}\nR² = {r_squared:.4f}', fontsize=9, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=7)
+                ax.tick_params(labelsize=7)
+            
+            self.multi_cal_fits_canvas.figure.tight_layout()
+            self.multi_cal_fits_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error plotting peak fits: {e}")
+    
+    def plot_multi_element_calibration_curves(self, element_results, successful_elements):
+        """Plot calibration curves for all successfully calibrated elements"""
+        try:
+            # Determine grid layout based on number of elements
+            n_elements = len(successful_elements)
+            if n_elements == 1:
+                rows, cols = 1, 1
+            elif n_elements == 2:
+                rows, cols = 1, 2
+            elif n_elements <= 4:
+                rows, cols = 2, 2
+            elif n_elements <= 6:
+                rows, cols = 2, 3
+            elif n_elements <= 9:
+                rows, cols = 3, 3
+            else:
+                rows, cols = 4, 3
+            
+            # Clear and setup figure
+            self.multi_cal_curves_canvas.figure.clear()
+            
+            # Create subplots
+            for idx, element in enumerate(successful_elements):
+                if idx >= rows * cols:
+                    break  # Don't plot more than grid allows
+                
+                ax = self.multi_cal_curves_canvas.figure.add_subplot(rows, cols, idx + 1)
+                
+                results = element_results[element]
+                intensities = np.array(results['intensities'])
+                concentrations = np.array(results['concentrations'])
+                standards = results['standards']
+                
+                # Calculate calibration line
+                slope, intercept, r_value, p_value, std_err = stats.linregress(intensities, concentrations)
+                
+                # Plot data points
+                ax.scatter(intensities, concentrations, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
+                
+                # Plot calibration line
+                x_line = np.linspace(0, max(intensities) * 1.1, 100)
+                y_line = slope * x_line + intercept
+                ax.plot(x_line, y_line, 'r-', linewidth=2, label=f'y = {slope:.3f}x + {intercept:.1f}')
+                
+                # Annotate points with standard names
+                for i, (x, y, std) in enumerate(zip(intensities, concentrations, standards)):
+                    ax.annotate(std, (x, y), xytext=(5, 5), textcoords='offset points', 
+                               fontsize=8, alpha=0.7)
+                
+                # Labels and title
+                ax.set_xlabel('Integrated Intensity (cps)', fontsize=9)
+                ax.set_ylabel('Concentration (ppm)', fontsize=9)
+                ax.set_title(f'{element} - R² = {r_value**2:.4f}', fontsize=10, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8)
+                
+                # Force origin to be visible
+                ax.set_xlim(left=0)
+                ax.set_ylim(bottom=min(0, min(concentrations) * 0.9))
+            
+            self.multi_cal_curves_canvas.figure.tight_layout()
+            self.multi_cal_curves_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error plotting calibration curves: {e}")
+    
+    def setup_fp_tab(self, tab):
+        """Setup the Fundamental Parameters (FP) method tab"""
+        layout = QVBoxLayout(tab)
+        
+        # Info label
+        info_text = "⚛️ <b>Fundamental Parameters (FP) Method</b><br>"
+        if HAS_XRAYLIB:
+            info_text += "Physics-based quantitative XRF analysis using Sherman equation and xraylib atomic data."
+        else:
+            info_text += "⚠️ <b>xraylib not installed!</b> Install with: <code>pip install xraylib</code>"
+        
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("""
+            QLabel {
+                background-color: #FFF3E0;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 11px;
+            }
+        """)
+        layout.addWidget(info_label)
+        
+        if not HAS_XRAYLIB:
+            # Show installation instructions
+            install_group = QGroupBox("Installation Required")
+            install_layout = QVBoxLayout(install_group)
+            
+            install_text = QLabel(
+                "The Fundamental Parameters method requires the <b>xraylib</b> library.<br><br>"
+                "To install:<br>"
+                "1. Open terminal/command prompt<br>"
+                "2. Run: <code>pip install xraylib</code><br>"
+                "3. Restart this application<br><br>"
+                "xraylib provides X-ray cross-sections, fluorescence yields, and other atomic data."
+            )
+            install_text.setWordWrap(True)
+            install_layout.addWidget(install_text)
+            
+            layout.addWidget(install_group)
+            layout.addStretch()
+            return
+        
+        # Instrument parameters
+        instrument_group = QGroupBox("Instrument Parameters")
+        instrument_layout = QGridLayout(instrument_group)
+        
+        instrument_layout.addWidget(QLabel("X-ray Tube Voltage (kV):"), 0, 0)
+        self.fp_tube_voltage = QDoubleSpinBox()
+        self.fp_tube_voltage.setRange(10, 100)
+        self.fp_tube_voltage.setValue(50.0)
+        self.fp_tube_voltage.setDecimals(1)
+        instrument_layout.addWidget(self.fp_tube_voltage, 0, 1)
+        
+        instrument_layout.addWidget(QLabel("Tube Current (mA):"), 1, 0)
+        self.fp_tube_current = QDoubleSpinBox()
+        self.fp_tube_current.setRange(0.1, 10.0)
+        self.fp_tube_current.setValue(1.0)
+        self.fp_tube_current.setDecimals(2)
+        instrument_layout.addWidget(self.fp_tube_current, 1, 1)
+        
+        instrument_layout.addWidget(QLabel("Tube Element:"), 2, 0)
+        self.fp_tube_element = QComboBox()
+        self.fp_tube_element.addItems(['Rh', 'W', 'Mo', 'Cr', 'Ag'])
+        self.fp_tube_element.setCurrentText('Rh')
+        instrument_layout.addWidget(self.fp_tube_element, 2, 1)
+        
+        instrument_layout.addWidget(QLabel("Detector Angle (°):"), 3, 0)
+        self.fp_detector_angle = QDoubleSpinBox()
+        self.fp_detector_angle.setRange(0, 90)
+        self.fp_detector_angle.setValue(45.0)
+        self.fp_detector_angle.setDecimals(1)
+        instrument_layout.addWidget(self.fp_detector_angle, 3, 1)
+        
+        instrument_layout.addWidget(QLabel("Takeoff Angle (°):"), 4, 0)
+        self.fp_takeoff_angle = QDoubleSpinBox()
+        self.fp_takeoff_angle.setRange(0, 90)
+        self.fp_takeoff_angle.setValue(45.0)
+        self.fp_takeoff_angle.setDecimals(1)
+        instrument_layout.addWidget(self.fp_takeoff_angle, 4, 1)
+        
+        layout.addWidget(instrument_group)
+        
+        # File selection
+        file_group = QGroupBox("Spectrum File")
+        file_layout = QHBoxLayout(file_group)
+        
+        self.fp_file_label = QLabel("No file selected")
+        file_layout.addWidget(self.fp_file_label)
+        
+        fp_load_btn = QPushButton("📁 Load Spectrum")
+        fp_load_btn.clicked.connect(self.fp_load_spectrum)
+        file_layout.addWidget(fp_load_btn)
+        
+        layout.addWidget(file_group)
+        
+        # Elements to analyze
+        elements_group = QGroupBox("Elements to Analyze")
+        elements_layout = QVBoxLayout(elements_group)
+        
+        elements_info = QLabel("Select elements present in your sample (detected from Search tab or manual):")
+        elements_layout.addWidget(elements_info)
+        
+        # Button to import from Search tab
+        import_search_btn = QPushButton("⬅️ Import Elements from Search Tab")
+        import_search_btn.clicked.connect(self.fp_import_from_search)
+        import_search_btn.setToolTip("Import detected elements from Search tab")
+        import_search_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        elements_layout.addWidget(import_search_btn)
+        
+        # List of elements to analyze
+        self.fp_elements_list = QListWidget()
+        self.fp_elements_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.fp_elements_list.setMaximumHeight(120)
+        elements_layout.addWidget(self.fp_elements_list)
+        
+        elements_btn_layout = QHBoxLayout()
+        add_element_btn = QPushButton("+ Add Element")
+        add_element_btn.clicked.connect(self.fp_add_element_to_list)
+        elements_btn_layout.addWidget(add_element_btn)
+        
+        remove_element_btn = QPushButton("- Remove Selected")
+        remove_element_btn.clicked.connect(self.fp_remove_element_from_list)
+        elements_btn_layout.addWidget(remove_element_btn)
+        
+        clear_elements_btn = QPushButton("Clear All")
+        clear_elements_btn.clicked.connect(lambda: self.fp_elements_list.clear())
+        elements_btn_layout.addWidget(clear_elements_btn)
+        
+        elements_layout.addLayout(elements_btn_layout)
+        layout.addWidget(elements_group)
+        
+        # Known composition (optional - for spiked samples)
+        known_comp_group = QGroupBox("Known Composition (Optional - for spiked samples)")
+        known_comp_layout = QVBoxLayout(known_comp_group)
+        
+        known_info = QLabel("Only fill this if you spiked the sample with known amounts:")
+        known_info.setStyleSheet("color: gray; font-style: italic;")
+        known_comp_layout.addWidget(known_info)
+        
+        self.fp_known_comp_table = QTableWidget(0, 2)
+        self.fp_known_comp_table.setHorizontalHeaderLabels(['Element', 'Known Mass Fraction'])
+        self.fp_known_comp_table.setMaximumHeight(100)
+        known_comp_layout.addWidget(self.fp_known_comp_table)
+        
+        known_btn_layout = QHBoxLayout()
+        add_known_btn = QPushButton("+ Add Known")
+        add_known_btn.clicked.connect(self.fp_add_known_composition)
+        known_btn_layout.addWidget(add_known_btn)
+        
+        remove_known_btn = QPushButton("- Remove")
+        remove_known_btn.clicked.connect(self.fp_remove_known_composition)
+        known_btn_layout.addWidget(remove_known_btn)
+        
+        known_comp_layout.addLayout(known_btn_layout)
+        layout.addWidget(known_comp_group)
+        
+        # Analysis buttons
+        analysis_group = QGroupBox("Analysis")
+        analysis_layout = QVBoxLayout(analysis_group)
+        
+        self.fp_fit_btn = QPushButton("⚙️ Fit Composition from Spectrum")
+        self.fp_fit_btn.clicked.connect(self.fp_fit_composition)
+        self.fp_fit_btn.setEnabled(False)
+        self.fp_fit_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
+        self.fp_fit_btn.setToolTip("Use FP method to determine elemental composition from measured intensities")
+        analysis_layout.addWidget(self.fp_fit_btn)
+        
+        self.fp_calculate_btn = QPushButton("🔬 Calculate Theoretical Intensities")
+        self.fp_calculate_btn.clicked.connect(self.fp_calculate_intensities)
+        self.fp_calculate_btn.setEnabled(False)
+        self.fp_calculate_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        self.fp_calculate_btn.setToolTip("Calculate what intensities SHOULD be for a given composition (requires known composition)")
+        analysis_layout.addWidget(self.fp_calculate_btn)
+        
+        layout.addWidget(analysis_group)
+        
+        # Results display
+        results_group = QGroupBox("FP Results")
+        results_layout = QVBoxLayout(results_group)
+        
+        self.fp_results_text = QTextEdit()
+        self.fp_results_text.setReadOnly(True)
+        self.fp_results_text.setMaximumHeight(200)
+        results_layout.addWidget(self.fp_results_text)
+        
+        layout.addWidget(results_group)
+        layout.addStretch()
+    
+    def fp_load_spectrum(self):
+        """Load spectrum for FP analysis"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Spectrum File", "", "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                data = self.read_xrf_file(file_path)
+                if data is None:
+                    raise Exception("Could not parse spectrum file")
+                
+                self.fp_spectrum_data = {'energy': data[0], 'counts': data[1], 'file_path': file_path}
+                self.fp_file_label.setText(os.path.basename(file_path))
+                self.fp_calculate_btn.setEnabled(True)
+                self.fp_fit_btn.setEnabled(True)
+                
+                QMessageBox.information(self, "Success", "Spectrum loaded successfully!")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load spectrum:\n{str(e)}")
+    
+    def fp_import_from_search(self):
+        """Import detected elements from Search tab"""
+        if not hasattr(self, 'search_element_matches') or not self.search_element_matches:
+            QMessageBox.warning(self, "No Elements", 
+                              "No elements detected in Search tab.\n\n"
+                              "Please:\n"
+                              "1. Go to Search tab\n"
+                              "2. Load a spectrum\n"
+                              "3. Click 'Search for Elements'\n"
+                              "4. Return here and click this button")
+            return
+        
+        # Clear existing list
+        self.fp_elements_list.clear()
+        
+        # Add detected elements
+        for element in sorted(self.search_element_matches.keys()):
+            self.fp_elements_list.addItem(element)
+        
+        n_elements = len(self.search_element_matches)
+        QMessageBox.information(self, "Import Successful", 
+                              f"Imported {n_elements} elements from Search tab.\n\n"
+                              f"These elements will be used to fit composition from your spectrum.")
+    
+    def fp_add_element_to_list(self):
+        """Add element to analysis list"""
+        # Show dialog to select element
+        element, ok = QInputDialog.getItem(self, "Add Element", "Select element:", 
+                                          sorted(ELEMENT_DEFINITIONS.keys()), 0, False)
+        if ok and element:
+            # Check if already in list
+            items = [self.fp_elements_list.item(i).text() for i in range(self.fp_elements_list.count())]
+            if element not in items:
+                self.fp_elements_list.addItem(element)
+            else:
+                QMessageBox.information(self, "Already Added", f"{element} is already in the list.")
+    
+    def fp_remove_element_from_list(self):
+        """Remove selected elements from list"""
+        for item in self.fp_elements_list.selectedItems():
+            self.fp_elements_list.takeItem(self.fp_elements_list.row(item))
+    
+    def fp_add_known_composition(self):
+        """Add known composition for spiked sample"""
+        row = self.fp_known_comp_table.rowCount()
+        self.fp_known_comp_table.insertRow(row)
+        
+        # Element combo box
+        element_combo = QComboBox()
+        for symbol in ELEMENT_DEFINITIONS.keys():
+            element_combo.addItem(symbol)
+        self.fp_known_comp_table.setCellWidget(row, 0, element_combo)
+        
+        # Mass fraction spin box
+        fraction_spin = QDoubleSpinBox()
+        fraction_spin.setRange(0, 1)
+        fraction_spin.setValue(0.1)
+        fraction_spin.setDecimals(4)
+        fraction_spin.setSingleStep(0.01)
+        self.fp_known_comp_table.setCellWidget(row, 1, fraction_spin)
+    
+    def fp_remove_known_composition(self):
+        """Remove selected known composition"""
+        current_row = self.fp_known_comp_table.currentRow()
+        if current_row >= 0:
+            self.fp_known_comp_table.removeRow(current_row)
+    
+    def fp_fit_composition(self):
+        """Fit composition from measured spectrum using FP method - THE MAIN FUNCTION"""
+        if not hasattr(self, 'fp_spectrum_data'):
+            QMessageBox.warning(self, "No Data", "Please load a spectrum first.")
+            return
+        
+        # Get elements to analyze
+        elements = [self.fp_elements_list.item(i).text() for i in range(self.fp_elements_list.count())]
+        
+        if not elements:
+            QMessageBox.warning(self, "No Elements", 
+                              "Please add elements to analyze.\n\n"
+                              "Use 'Import Elements from Search Tab' or '+ Add Element'.")
+            return
+        
+        try:
+            # Initialize FP calculator
+            fp = XRFFundamentalParameters(
+                tube_voltage=self.fp_tube_voltage.value(),
+                tube_current=self.fp_tube_current.value(),
+                tube_element=self.fp_tube_element.currentText(),
+                detector_angle=self.fp_detector_angle.value(),
+                takeoff_angle=self.fp_takeoff_angle.value()
+            )
+            
+            # Extract measured intensities from spectrum using existing peak fitter
+            measured_intensities = {}
+            energy = self.fp_spectrum_data['energy']
+            counts = self.fp_spectrum_data['counts']
+            
+            for element in elements:
+                # Use existing peak fitter to get intensity
+                element_fitter = XRFPeakFitter(element=element)
+                try:
+                    fit_params, fit_curve, r_squared, x_fit, integrated_intensity, concentration = element_fitter.fit_peak(
+                        energy, counts, peak_region=None, background_subtract=True, integration_region=None
+                    )
+                    measured_intensities[element] = integrated_intensity
+                except:
+                    # If fit fails, skip this element
+                    print(f"Warning: Could not fit {element}")
+                    continue
+            
+            if not measured_intensities:
+                QMessageBox.warning(self, "No Peaks Found", 
+                                  "Could not extract peak intensities for any elements.\n\n"
+                                  "Make sure the elements are actually present in the spectrum.")
+                return
+            
+            # Fit composition using FP method
+            fitted_composition = fp.fit_composition(measured_intensities, normalize=True)
+            
+            # Display results
+            results_text = "⚙️ FP Method: Fitted Composition from Spectrum\n"
+            results_text += "=" * 50 + "\n\n"
+            results_text += f"Instrument: {self.fp_tube_element.currentText()} @ {self.fp_tube_voltage.value()} kV\n"
+            results_text += f"File: {os.path.basename(self.fp_spectrum_data['file_path'])}\n\n"
+            
+            results_text += "Measured Intensities (cps):\n"
+            results_text += "-" * 50 + "\n"
+            for elem, intensity in measured_intensities.items():
+                results_text += f"  {elem}: {intensity:.1f}\n"
+            
+            results_text += "\n✨ FITTED COMPOSITION (Mass Fractions):\n"
+            results_text += "=" * 50 + "\n"
+            for elem in sorted(fitted_composition.keys()):
+                frac = fitted_composition[elem]
+                ppm = frac * 1e6
+                percent = frac * 100
+                results_text += f"  {elem}: {frac:.6f} ({percent:.4f}% or {ppm:.1f} ppm)\n"
+            
+            results_text += "\nNote: This is a physics-based quantification using\n"
+            results_text += "fundamental parameters (Sherman equation). Matrix\n"
+            results_text += "effects are automatically accounted for.\n"
+            
+            self.fp_results_text.setText(results_text)
+            
+            # Plot composition as pie chart
+            self.plot_canvas.figure.clear()
+            ax = self.plot_canvas.figure.add_subplot(111)
+            
+            labels = [f"{elem}\n{fitted_composition[elem]*100:.2f}%" for elem in sorted(fitted_composition.keys())]
+            values = [fitted_composition[elem] for elem in sorted(fitted_composition.keys())]
+            colors = plt.cm.Set3(np.linspace(0, 1, len(values)))
+            
+            ax.pie(values, labels=labels, colors=colors, autopct='', startangle=90)
+            ax.set_title('Fitted Elemental Composition (FP Method)', fontsize=12, fontweight='bold')
+            
+            self.plot_canvas.figure.tight_layout()
+            self.plot_canvas.draw()
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"FP fitting failed:\n{str(e)}\n\nCheck console for details.")
+    
+    def fp_calculate_intensities(self):
+        """Calculate theoretical intensities for KNOWN composition (for validation/spiked samples)"""
+        if not hasattr(self, 'fp_spectrum_data'):
+            QMessageBox.warning(self, "No Data", "Please load a spectrum first.")
+            return
+        
+        # Get known composition
+        known_comp = {}
+        for row in range(self.fp_known_comp_table.rowCount()):
+            element_widget = self.fp_known_comp_table.cellWidget(row, 0)
+            fraction_widget = self.fp_known_comp_table.cellWidget(row, 1)
+            
+            if element_widget and fraction_widget:
+                element = element_widget.currentText()
+                fraction = fraction_widget.value()
+                known_comp[element] = fraction
+        
+        if not known_comp:
+            QMessageBox.warning(self, "No Known Composition", 
+                              "This function calculates theoretical intensities for a KNOWN composition.\n\n"
+                              "Please add elements and mass fractions in the 'Known Composition' table.\n\n"
+                              "If you want to DETERMINE composition from your spectrum, use\n"
+                              "'Fit Composition from Spectrum' button instead.")
+            return
+        
+        try:
+            # Initialize FP calculator
+            fp = XRFFundamentalParameters(
+                tube_voltage=self.fp_tube_voltage.value(),
+                tube_current=self.fp_tube_current.value(),
+                tube_element=self.fp_tube_element.currentText(),
+                detector_angle=self.fp_detector_angle.value(),
+                takeoff_angle=self.fp_takeoff_angle.value()
+            )
+            
+            # Normalize composition
+            total = sum(known_comp.values())
+            known_comp = {k: v/total for k, v in known_comp.items()}
+            
+            # Calculate theoretical intensities
+            results_text = "🔬 Theoretical FP Intensities for Known Composition\n"
+            results_text += "=" * 50 + "\n\n"
+            results_text += f"Tube: {self.fp_tube_element.currentText()} @ {self.fp_tube_voltage.value()} kV\n\n"
+            results_text += "Input Composition (normalized):\n"
+            
+            for elem, frac in known_comp.items():
+                results_text += f"  {elem}: {frac:.4f} ({frac*100:.2f}%)\n"
+            
+            results_text += "\nTheoretical Intensities:\n"
+            results_text += "-" * 50 + "\n"
+            
+            for elem in known_comp.keys():
+                intensity = fp.calculate_primary_intensity(elem, known_comp[elem], known_comp, 'KA1')
+                results_text += f"{elem} K-alpha: {intensity:.6f} (arbitrary units)\n"
+                
+                # Try L-alpha for heavy elements
+                if fp.line_energy(elem, 'LA1') > 0:
+                    intensity_l = fp.calculate_primary_intensity(elem, known_comp[elem], known_comp, 'LA1')
+                    results_text += f"{elem} L-alpha: {intensity_l:.6f} (arbitrary units)\n"
+            
+            results_text += "\nUse this to validate your instrument or compare\n"
+            results_text += "with measured intensities from spiked samples.\n"
+            
+            self.fp_results_text.setText(results_text)
+            
+            # Plot tube spectrum
+            energy_range = np.linspace(0, self.fp_tube_voltage.value(), 500)
+            tube_spectrum = fp.get_tube_spectrum(energy_range)
+            
+            self.plot_canvas.figure.clear()
+            ax = self.plot_canvas.figure.add_subplot(111)
+            ax.plot(energy_range, tube_spectrum, 'b-', linewidth=1.5)
+            ax.set_xlabel('Energy (keV)', fontsize=10)
+            ax.set_ylabel('Relative Intensity', fontsize=10)
+            ax.set_title(f'X-ray Tube Spectrum ({self.fp_tube_element.currentText()} @ {self.fp_tube_voltage.value()} kV)', 
+                        fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            self.plot_canvas.figure.tight_layout()
+            self.plot_canvas.draw()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"FP calculation failed:\n{str(e)}")
 
 
 class ProtocolDialog(QDialog):
